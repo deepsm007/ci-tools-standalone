@@ -1,4 +1,4 @@
-TOOLS := backport-verifier cluster-manifest-verifier commenter ci-scheduling-webhook determinize-peribolos gpu-scheduling-webhook helpdesk-faq pipeline-controller pr-reminder publicize retester
+TOOLS := alert-proxy backport-verifier cluster-manifest-verifier commenter ci-scheduling-webhook determinize-peribolos gpu-scheduling-webhook helpdesk-faq pipeline-controller pr-reminder publicize retester
 
 .PHONY: build-all test clean format gofmt lint validate-modules $(addprefix build-,$(TOOLS)) $(addprefix image-,$(TOOLS))
 
