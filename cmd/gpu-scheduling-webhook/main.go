@@ -11,7 +11,6 @@ import (
 	"github.com/spf13/cobra"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
@@ -72,13 +71,8 @@ type options struct {
 
 type gpuTolerator struct{}
 
-func (*gpuTolerator) Default(ctx context.Context, obj runtime.Object) error {
+func (*gpuTolerator) Default(ctx context.Context, pod *corev1.Pod) error {
 	logger := log.FromContext(ctx)
-
-	pod, ok := obj.(*corev1.Pod)
-	if !ok {
-		return fmt.Errorf("expected a Pod but got a %T", obj)
-	}
 
 	logger = logger.WithValues("pod", fmt.Sprintf("%s/%s", pod.Namespace, pod.Name))
 
@@ -206,8 +200,7 @@ func startWebhookServer(ctx context.Context, logger *logr.Logger, o *options, cf
 
 	logger.WithValues("Addr", o.healthProbeAddr).Info("Serving healthiness probes")
 
-	if err := builder.WebhookManagedBy(mgr).
-		For(&corev1.Pod{}).
+	if err := builder.WebhookManagedBy(mgr, &corev1.Pod{}).
 		WithDefaulter(&gpuTolerator{}).
 		Complete(); err != nil {
 		logger.Error(err, "Unable to build webhook")
