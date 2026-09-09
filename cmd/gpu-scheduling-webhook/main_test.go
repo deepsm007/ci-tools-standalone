@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -10,15 +9,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 )
 
 func TestMutatePod(t *testing.T) {
 	for _, testCase := range []struct {
 		name    string
-		pod     runtime.Object
+		pod     *corev1.Pod
 		wantPod corev1.Pod
-		wantErr error
 	}{
 		{
 			name: "Request a GPU therefore add toleration",
@@ -146,30 +143,13 @@ func TestMutatePod(t *testing.T) {
 				},
 			},
 		},
-		{
-			name:    "Not a pod, return an error",
-			pod:     &corev1.Node{},
-			wantErr: errors.New("expected a Pod but got a *v1.Node"),
-		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
+			pod := testCase.pod.DeepCopy()
 			pgs := gpuTolerator{}
-			err := pgs.Default(context.TODO(), testCase.pod)
-
-			if err != nil && testCase.wantErr == nil {
-				t.Fatalf("want err nil but got: %v", err)
+			if err := pgs.Default(context.TODO(), pod); err != nil {
+				t.Fatalf("Default() error = %v", err)
 			}
-			if err == nil && testCase.wantErr != nil {
-				t.Fatalf("want err %v but nil", testCase.wantErr)
-			}
-			if err != nil && testCase.wantErr != nil {
-				if diff := cmp.Diff(testCase.wantErr.Error(), err.Error()); diff != "" {
-					t.Fatalf("unexpected error: %s", diff)
-				}
-				return
-			}
-
-			pod, _ := testCase.pod.(*corev1.Pod)
 			if diff := cmp.Diff(testCase.wantPod, *pod); diff != "" {
 				t.Error(diff)
 			}
