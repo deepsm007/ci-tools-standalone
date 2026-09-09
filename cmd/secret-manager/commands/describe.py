@@ -49,8 +49,9 @@ def describe(output: str, collection: str, secret_path: str):
     The SECRET_PATH should be in the format 'group/field' (e.g., 'aws/password').
     """
 
-    ensure_authentication()
     client = secretmanager.SecretManagerServiceClient()
+    ensure_authentication(client, collection)
+
     full_secret_path = client.secret_path(
         PROJECT_ID, get_secret_name(collection, secret_path)
     )
