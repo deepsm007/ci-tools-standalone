@@ -60,7 +60,6 @@ def create(collection: str, secret_path: str, from_file: str, from_literal: str)
 
     Example: secret-manager create -c my-collection aws/password -l "secret value"
     """
-    ensure_authentication()
     validate_secret_source(from_file, from_literal)
 
     if not check_if_collection_exists(collection):
@@ -70,6 +69,7 @@ def create(collection: str, secret_path: str, from_file: str, from_literal: str)
             "See: https://docs.ci.openshift.org/docs/how-tos/adding-a-new-secret-to-ci/"
         )
     client = secretmanager.SecretManagerServiceClient()
+    ensure_authentication(client, collection)
 
     index_secrets = get_secrets_from_index(client, collection)
     path_normalized = secret_path.replace("/", "__")

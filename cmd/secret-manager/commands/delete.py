@@ -31,8 +31,8 @@ def delete(collection: str, secret_path: str):
     The SECRET_PATH should be in the format 'group/field' (e.g., 'aws/password').
     """
 
-    ensure_authentication()
     client = secretmanager.SecretManagerServiceClient()
+    ensure_authentication(client, collection)
 
     index_secrets = get_secrets_from_index(client, collection)
     secret_id_normalized = secret_path.replace("/", "__")

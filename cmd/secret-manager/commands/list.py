@@ -47,8 +47,9 @@ def list_secrets(output: str, collection: str, rover_group: str):
         )
 
     if collection != "":
-        ensure_authentication()
-        list_secrets_for_collection(collection, output)
+        client = secretmanager.SecretManagerServiceClient()
+        ensure_authentication(client, collection)
+        list_secrets_for_collection(client, collection, output)
         return
 
     collections_dict = get_group_collections()
@@ -84,9 +85,10 @@ def list_collections_for_rover_group(
             click.echo(f"{collection}")
 
 
-def list_secrets_for_collection(collection: str, output: str):
-    secret_list = get_secrets_from_index(
-        secretmanager.SecretManagerServiceClient(), collection
+def list_secrets_for_collection(
+    client: secretmanager.SecretManagerServiceClient, collection: str, output: str
+):
+    secret_list = get_secrets_from_index(client, collection
     )
 
     paths = [secret.replace("__", "/") for secret in secret_list]

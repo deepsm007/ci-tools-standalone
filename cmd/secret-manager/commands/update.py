@@ -44,9 +44,9 @@ def update(collection: str, secret_path: str, from_file: str, from_literal: str)
     The SECRET_PATH should be in the format 'group/field' (e.g., 'aws/password').
     """
 
-    ensure_authentication()
     validate_secret_source(from_file, from_literal)
     client = secretmanager.SecretManagerServiceClient()
+    ensure_authentication(client, collection)
 
     # Check if secret exists in both index and GSM
     path_normalized = secret_path.replace("/", "__")

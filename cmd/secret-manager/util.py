@@ -41,9 +41,13 @@ REQUEST_INFO = "request-information"
 SECRET_NAME_MAX_LENGTH = 200
 
 
-def ensure_authentication():
+def ensure_authentication(
+    client: secretmanager.SecretManagerServiceClient, collection: str
+):
     """
     Ensures that the user is authenticated with Google Cloud.
+    If client and collection are not empty, verifies that the user
+    has permission to access secrets in a collection.
 
     Raises:
         click.ClickException: If application default credentials are not found.
@@ -54,6 +58,23 @@ def ensure_authentication():
         raise click.ClickException(
             "Credentials for authenticating into google cloud not found. Run the `login` command to authenticate."
         ) from e
+
+    if client and collection != "":
+        index_secret = client.secret_version_path(
+            PROJECT_ID, get_index_secret_for_collection(collection), "latest"
+        )
+        try:
+            client.access_secret_version(request={"name": index_secret})
+        except PermissionDenied:
+            raise click.ClickException(
+                f"You don't have permission to access secrets in collection '{collection}'."
+            )
+        except NotFound:
+            raise click.ClickException(f"Collection '{collection}' does not exist.")
+        except Exception as e:
+            raise click.ClickException(
+                f"Failed to access collection '{collection}': {e}"
+            )
 
 
 def validate_collection(_ctx, _param, value):
@@ -101,13 +122,17 @@ def validate_secret_name(_ctx, _param, value):
         raise click.BadParameter("Cannot end with an underscore")
 
     # Allow single char OR multi-char with underscores in middle only
-    if not re.fullmatch(r"[A-Za-z0-9-]([A-Za-z0-9-_]*[A-Za-z0-9-])?|[A-Za-z0-9-]", value):
+    if not re.fullmatch(
+        r"[A-Za-z0-9-]([A-Za-z0-9-_]*[A-Za-z0-9-])?|[A-Za-z0-9-]", value
+    ):
         invalid_chars = set(re.findall(r"[^A-Za-z0-9-_]", value))
         raise click.BadParameter(
             f"May only contain letters, numbers, dashes, or an underscore. Invalid characters: {', '.join(repr(c) for c in sorted(invalid_chars))}"
         )
     if len(value) > SECRET_NAME_MAX_LENGTH:
-        raise click.BadParameter(f"Secret name must be less than {SECRET_NAME_MAX_LENGTH} characters.")
+        raise click.BadParameter(
+            f"Secret name must be less than {SECRET_NAME_MAX_LENGTH} characters."
+        )
     return value
 
 
@@ -251,7 +276,7 @@ def create_payload(from_file: str, from_literal: str) -> bytes:
 
         with open(resolved_path, "rb") as f:
             return f.read()
-    except (OSError, IOError) as e:
+    except OSError as e:
         raise click.UsageError(f"Failed to read file '{from_file}': {e}") from e
     except click.UsageError:
         raise
@@ -348,9 +373,7 @@ def get_secrets_from_index(
             f"You don't have permission to access secrets in collection '{collection}'."
         )
     except NotFound:
-        raise click.ClickException(
-            f"Collection '{collection}' does not exist."
-        )
+        raise click.ClickException(f"Collection '{collection}' does not exist.")
     except Exception as e:
         raise click.ClickException(
             f"Failed to list secrets for collection '{collection}': {e}"
