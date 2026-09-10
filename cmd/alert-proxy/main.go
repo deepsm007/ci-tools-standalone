@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -39,6 +40,12 @@ type options struct {
 	gracePeriod                                                                                         time.Duration
 }
 
+const (
+	alertmanagerServiceHost               = "alertmanager-user-workload.openshift-user-workload-monitoring.svc"
+	alertmanagerServiceFullyQualifiedHost = "alertmanager-user-workload.openshift-user-workload-monitoring.svc.cluster.local"
+	alertmanagerServicePort               = "9095"
+)
+
 func gatherOptions(args []string) (options, error) {
 	var o options
 	fs := flag.NewFlagSet("alert-proxy", flag.ContinueOnError)
@@ -65,6 +72,31 @@ func gatherOptions(args []string) (options, error) {
 	fs.DurationVar(&o.gracePeriod, "grace-period", 30*time.Second, "HTTP shutdown grace period.")
 	return o, fs.Parse(args)
 }
+
+func validateAlertmanagerURL(value string) error {
+	parsed, err := url.ParseRequestURI(value)
+	if err != nil || !parsed.IsAbs() || parsed.Host == "" {
+		return errors.New("must be an absolute URL")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("must not contain user information, a query, or a fragment")
+	}
+	if parsed.Scheme != "https" {
+		return errors.New("scheme must be HTTPS")
+	}
+	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	if host != alertmanagerServiceHost && host != alertmanagerServiceFullyQualifiedHost {
+		return errors.New("must target the in-cluster Alertmanager service")
+	}
+	if parsed.Port() != alertmanagerServicePort {
+		return fmt.Errorf("must target Alertmanager service port %s", alertmanagerServicePort)
+	}
+	if parsed.EscapedPath() != "" && parsed.EscapedPath() != "/" {
+		return errors.New("must not contain an API path")
+	}
+	return nil
+}
+
 func (o options) validate() error {
 	if o.channelID == "" {
 		return errors.New("--channel-id is required")
@@ -79,6 +111,9 @@ func (o options) validate() error {
 		if value == "" {
 			return fmt.Errorf("--%s is required", name)
 		}
+	}
+	if err := validateAlertmanagerURL(o.alertmanagerURL); err != nil {
+		return fmt.Errorf("invalid --alertmanager-url: %w", err)
 	}
 	return nil
 }

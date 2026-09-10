@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math/big"
 	"net"
@@ -196,6 +197,64 @@ func TestHTTPAlertmanagerAPIContract(t *testing.T) {
 	}
 	if !sawAlerts || !sawUpsert || !sawDelete {
 		t.Fatalf("calls alerts=%v upsert=%v delete=%v", sawAlerts, sawUpsert, sawDelete)
+	}
+}
+
+func TestHTTPAlertmanagerErrorsAreRedacted(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenPath, []byte("token\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	const marker = "do-not-log"
+	testCases := []struct {
+		name          string
+		baseURL       string
+		transport     roundTripperFunc
+		wantStatus    int
+		wantImmediate bool
+	}{
+		{
+			name:    "transport error",
+			baseURL: "https://user:" + marker + "@example.invalid?token=" + marker,
+			transport: func(*http.Request) (*http.Response, error) {
+				return nil, errors.New("transport failure containing " + marker)
+			},
+		},
+		{
+			name:    "HTTP response body",
+			baseURL: "https://alertmanager.example",
+			transport: func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusServiceUnavailable, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(marker))}, nil
+			},
+			wantStatus: http.StatusServiceUnavailable,
+		},
+		{
+			name:    "certificate error",
+			baseURL: "https://alertmanager.example",
+			transport: func(*http.Request) (*http.Response, error) {
+				return nil, &tls.CertificateVerificationError{Err: errors.New("certificate failure containing " + marker)}
+			},
+			wantImmediate: true,
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			api := &HTTPAlertmanager{BaseURL: testCase.baseURL, TokenPath: tokenPath, Client: &http.Client{Transport: testCase.transport}}
+			_, err := api.ListAlerts(context.Background())
+			if err == nil || strings.Contains(err.Error(), marker) {
+				t.Fatalf("unsafe Alertmanager error: %v", err)
+			}
+			if testCase.wantStatus != 0 {
+				var httpErr *AMHTTPError
+				if !errors.As(err, &httpErr) || httpErr.StatusCode != testCase.wantStatus {
+					t.Fatalf("error = %v, want HTTP status %d", err, testCase.wantStatus)
+				}
+			}
+			if testCase.wantImmediate && !isImmediateAMFailure(err) {
+				t.Fatalf("certificate error was not an immediate readiness failure: %v", err)
+			}
+		})
 	}
 }
 
