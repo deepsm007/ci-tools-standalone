@@ -439,7 +439,11 @@ func (a *HTTPAlertmanager) clientLocked() (*http.Client, error) {
 
 func (a *HTTPAlertmanager) do(req *http.Request) (*http.Response, error) {
 	if a.Client != nil {
-		return a.Client.Do(req)
+		response, err := a.Client.Do(req)
+		if err != nil {
+			return nil, redactedAlertmanagerError("send Alertmanager request", err)
+		}
+		return response, nil
 	}
 	a.clientMu.Lock()
 	defer a.clientMu.Unlock()
@@ -447,7 +451,32 @@ func (a *HTTPAlertmanager) do(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	return client.Do(req)
+	response, err := client.Do(req)
+	if err != nil {
+		return nil, redactedAlertmanagerError("send Alertmanager request", err)
+	}
+	return response, nil
+}
+
+func redactedAlertmanagerError(operation string, err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return fmt.Errorf("%s: %w", operation, context.Canceled)
+	case errors.Is(err, context.DeadlineExceeded):
+		return fmt.Errorf("%s: %w", operation, context.DeadlineExceeded)
+	case isCertificateValidationError(err):
+		return fmt.Errorf("%s: certificate validation failed", operation)
+	default:
+		return fmt.Errorf("%s failed", operation)
+	}
+}
+
+func isCertificateValidationError(err error) bool {
+	var verificationError *tls.CertificateVerificationError
+	var hostnameError x509.HostnameError
+	var unknownAuthorityError x509.UnknownAuthorityError
+	var invalidError x509.CertificateInvalidError
+	return errors.As(err, &verificationError) || errors.As(err, &hostnameError) || errors.As(err, &unknownAuthorityError) || errors.As(err, &invalidError)
 }
 
 func (a *HTTPAlertmanager) request(ctx context.Context, method, path string, body any, out any) error {
@@ -465,7 +494,7 @@ func (a *HTTPAlertmanager) request(ctx context.Context, method, path string, bod
 	}
 	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(a.BaseURL, "/")+path, reader)
 	if err != nil {
-		return err
+		return redactedAlertmanagerError("create Alertmanager request", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+string(token))
 	if body != nil {
@@ -476,9 +505,12 @@ func (a *HTTPAlertmanager) request(ctx context.Context, method, path string, bod
 		return err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return redactedAlertmanagerError("read Alertmanager response", err)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &AMHTTPError{StatusCode: resp.StatusCode, Body: string(raw)}
+		return &AMHTTPError{StatusCode: resp.StatusCode}
 	}
 	if out != nil && len(raw) > 0 {
 		if err := json.Unmarshal(raw, out); err != nil {
@@ -490,11 +522,10 @@ func (a *HTTPAlertmanager) request(ctx context.Context, method, path string, bod
 
 type AMHTTPError struct {
 	StatusCode int
-	Body       string
 }
 
 func (e *AMHTTPError) Error() string {
-	return fmt.Sprintf("Alertmanager returned %d: %s", e.StatusCode, e.Body)
+	return fmt.Sprintf("Alertmanager returned HTTP %d", e.StatusCode)
 }
 func (a *HTTPAlertmanager) ListSilences(ctx context.Context) ([]AMSilence, error) {
 	var out []AMSilence
