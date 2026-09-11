@@ -54,6 +54,8 @@ const (
 	openshiftDNSNamespace         = "openshift-dns"
 	dnsDefaultDaemonSetLabelKey   = "dns.operator.openshift.io/daemonset-dns"
 	dnsDefaultDaemonSetLabelValue = "default"
+	// CI worker nodes run node-resolver instead of dns-default; scale-down must drain both.
+	nodeResolverDaemonSetLabelKey = "dns.operator.openshift.io/daemonset-node-resolver"
 
 	// dnsLameduckWait covers CoreDNS health.lameduck (20s) plus endpoint propagation slack.
 	dnsLameduckWait    = 25 * time.Second
@@ -1265,10 +1267,20 @@ func (p *Prioritization) setNodeAvoidanceState(node *corev1.Node, podClass PodCl
 	return nil
 }
 
+type dnsPodLister func(nodeName string) (*corev1.PodList, error)
+
 func (p *Prioritization) listDNSDefaultPods(nodeName string) (*corev1.PodList, error) {
+	return p.listDNSPodsOnNode(nodeName, fmt.Sprintf("%s=%s", dnsDefaultDaemonSetLabelKey, dnsDefaultDaemonSetLabelValue))
+}
+
+func (p *Prioritization) listNodeResolverPods(nodeName string) (*corev1.PodList, error) {
+	return p.listDNSPodsOnNode(nodeName, nodeResolverDaemonSetLabelKey)
+}
+
+func (p *Prioritization) listDNSPodsOnNode(nodeName, labelSelector string) (*corev1.PodList, error) {
 	return p.k8sClientSet.CoreV1().Pods(openshiftDNSNamespace).List(p.context, metav1.ListOptions{
 		FieldSelector: fmt.Sprintf("spec.nodeName=%s", nodeName),
-		LabelSelector: fmt.Sprintf("%s=%s", dnsDefaultDaemonSetLabelKey, dnsDefaultDaemonSetLabelValue),
+		LabelSelector: labelSelector,
 	})
 }
 
@@ -1284,9 +1296,39 @@ func (p *Prioritization) gracefullyDrainClusterDNS(nodeName string) (err error) 
 		}
 	}()
 
-	podList, err := p.listDNSDefaultPods(nodeName)
+	drainTargets := []struct {
+		podType string
+		list    dnsPodLister
+	}{
+		{podType: "dns-default", list: p.listDNSDefaultPods},
+		{podType: "node-resolver", list: p.listNodeResolverPods},
+	}
+
+	evicted := false
+	for _, target := range drainTargets {
+		didEvict, evictErr := p.evictDNSPodsOnNode(nodeName, target.podType, target.list)
+		if evictErr != nil {
+			return evictErr
+		}
+		evicted = evicted || didEvict
+	}
+
+	if !evicted {
+		return nil
+	}
+
+	listers := make([]dnsPodLister, 0, len(drainTargets))
+	for _, target := range drainTargets {
+		listers = append(listers, target.list)
+	}
+	p.waitForDNSPodsDrained(nodeName, listers)
+	return nil
+}
+
+func (p *Prioritization) evictDNSPodsOnNode(nodeName, podType string, listPods dnsPodLister) (bool, error) {
+	podList, err := listPods(nodeName)
 	if err != nil {
-		return fmt.Errorf("listing dns-default pods on node %s: %w", nodeName, err)
+		return false, fmt.Errorf("listing %s pods on node %s: %w", podType, nodeName, err)
 	}
 
 	evicted := false
@@ -1312,44 +1354,47 @@ func (p *Prioritization) gracefullyDrainClusterDNS(nodeName string) (err error) 
 				continue
 			}
 			if kerrors.IsForbidden(evictionErr) {
-				return fmt.Errorf("evicting dns-default pod %s: %w", pod.Name, evictionErr)
+				return false, fmt.Errorf("evicting %s pod %s: %w", podType, pod.Name, evictionErr)
 			}
-			klog.Warningf("Unable to evict dns-default pod %s on node %v: %v", pod.Name, nodeName, evictionErr)
+			klog.Warningf("Unable to evict %s pod %s on node %v: %v", podType, pod.Name, nodeName, evictionErr)
 			continue
 		}
 
-		klog.Infof("Evicted dns-default pod %s from node %v for graceful shutdown", pod.Name, nodeName)
+		klog.Infof("Evicted %s pod %s from node %v for graceful shutdown", podType, pod.Name, nodeName)
 		evicted = true
 	}
 
-	if !evicted {
-		return nil
-	}
+	return evicted, nil
+}
 
+func (p *Prioritization) waitForDNSPodsDrained(nodeName string, listers []dnsPodLister) {
 	deadline := time.Now().Add(dnsLameduckWait)
 	for time.Now().Before(deadline) {
-		podList, listErr := p.listDNSDefaultPods(nodeName)
-		if listErr != nil {
-			klog.Warningf("Unable to check dns-default drain on node %v: %v", nodeName, listErr)
-			return nil
-		}
-
 		ready := false
-		for i := range podList.Items {
-			if podServingDNS(&podList.Items[i]) {
-				ready = true
+		for _, listPods := range listers {
+			podList, listErr := listPods(nodeName)
+			if listErr != nil {
+				klog.Warningf("Unable to check DNS pod drain on node %v: %v", nodeName, listErr)
+				return
+			}
+			for i := range podList.Items {
+				if podServingDNS(&podList.Items[i]) {
+					ready = true
+					break
+				}
+			}
+			if ready {
 				break
 			}
 		}
 		if !ready {
-			klog.Infof("dns-default pods drained on node %v", nodeName)
-			return nil
+			klog.Infof("DNS pods drained on node %v", nodeName)
+			return
 		}
 		time.Sleep(dnsDrainPollPeriod)
 	}
 
-	klog.Warningf("Timed out waiting for dns-default lameduck on node %v after %v", nodeName, dnsLameduckWait)
-	return nil
+	klog.Warningf("Timed out waiting for DNS pod lameduck on node %v after %v", nodeName, dnsLameduckWait)
 }
 
 func podServingDNS(pod *corev1.Pod) bool {
