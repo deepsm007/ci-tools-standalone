@@ -35,6 +35,7 @@ type fakeAgenticGitHub struct {
 	failCheck             bool
 	failCheckAfterCreate  bool
 	failCommentAfterWrite bool
+	failLabel             bool
 	failLabelAfterWrite   bool
 	checkAttempts         int
 	getPullRequestCalls   int
@@ -72,6 +73,9 @@ func (f *fakeAgenticGitHub) CreateStatus(_, _, _ string, status github.Status) e
 	return nil
 }
 func (f *fakeAgenticGitHub) AddLabel(_, _ string, _ int, label string) error {
+	if f.failLabel {
+		return io.ErrUnexpectedEOF
+	}
 	f.pr.Labels = append(f.pr.Labels, github.Label{Name: label})
 	if f.failLabelAfterWrite {
 		f.failLabelAfterWrite = false
@@ -350,14 +354,387 @@ func TestAgenticModeSwitchAndIdempotence(t *testing.T) {
 	f.reconcile(t, f.command(400, "agentic-mode"))
 	require.False(t, hasAgenticLabel(&f.gh.pr, agenticSkipLabel))
 	require.False(t, f.state().optOut)
-	require.Len(t, f.gh.checks, 2, "reenabling must emit check_run.created")
-	require.Equal(t, "failure", f.gh.checks[0].Conclusion, "old green run must not bypass the new pending gate")
-	require.Equal(t, "queued", f.gh.checks[1].Status)
+	require.Len(t, f.gh.checks, 1, "completed dispatch must not emit another readiness signal")
+	require.Equal(t, "success", f.gh.checks[0].Conclusion)
 	deadline = f.state().waitingUntil
 	f.now = f.now.Add(time.Minute)
 	f.reconcile(t, f.command(500, "agentic-mode"))
-	require.Len(t, f.gh.checks, 2)
+	require.Len(t, f.gh.checks, 1)
 	require.Equal(t, deadline, f.state().waitingUntil)
+}
+
+func TestAgenticReenableCompletedDispatchPreservesRevision(t *testing.T) {
+	for _, mode := range []string{"auto", "manual", "lgtm"} {
+		for _, restart := range []bool{false, true} {
+			for _, restore := range []string{"command", "label-removal"} {
+				t.Run(fmt.Sprintf("%s/restart=%t/%s", mode, restart, restore), func(t *testing.T) {
+					f := newAgenticFixture(t, mode)
+					f.passFirstStage()
+					f.reconcile(t, nil)
+					f.reconcile(t, f.command(100, "skip-agentic-mode"))
+					if !f.state().dispatched {
+						f.reconcile(t, f.command(200, "remaining"))
+					}
+					require.Equal(t, "success", f.gh.checks[0].Conclusion)
+					completed := f.gh.checks[0]
+					attempts, statuses := f.gh.checkAttempts, f.gh.statusWrites
+					if restart {
+						f.a.states = nil
+					}
+					if restore == "command" {
+						f.reconcile(t, f.command(300, "agentic-mode"))
+						require.Contains(t, f.gh.comments[len(f.gh.comments)-1].Body, "next HEAD SHA")
+					} else {
+						f.gh.pr.Labels = nil
+						f.reconcile(t, nil)
+					}
+					require.False(t, hasAgenticLabel(&f.gh.pr, agenticSkipLabel))
+					require.False(t, f.state().optOut)
+					require.True(t, f.state().dispatched)
+					require.True(t, f.state().ready)
+					require.True(t, f.state().waitingUntil.IsZero())
+					require.Equal(t, []github.CheckRun{completed}, f.gh.checks)
+					require.Equal(t, attempts, f.gh.checkAttempts)
+					require.Equal(t, statuses, f.gh.statusWrites)
+					comments := len(f.gh.comments)
+					f.a.states = nil
+					f.now = f.now.Add(2 * f.a.options.timeout)
+					f.reconcile(t, nil)
+					require.Equal(t, []github.CheckRun{completed}, f.gh.checks, "restart must preserve the completed revision")
+					require.Len(t, f.gh.comments, comments, "no redispatch or response timeout for this HEAD")
+					f.gh.pr.Head.SHA = strings.Repeat("b", 40)
+					f.a.reader = newFakePJLister()
+					f.reconcile(t, nil)
+					require.Len(t, f.gh.checks, 1, "next SHA still waits for first-stage success")
+					f.passFirstStage()
+					f.reconcile(t, nil)
+					require.Len(t, f.gh.checks, 2)
+					require.Equal(t, completed, f.gh.checks[0])
+					require.Equal(t, f.gh.pr.Head.SHA, f.gh.checks[1].HeadSHA)
+					require.Equal(t, "queued", f.gh.checks[1].Status)
+					require.Equal(t, agenticCheckTitle, f.gh.checks[1].Output.Title)
+				})
+			}
+		}
+	}
+}
+
+func TestAgenticReenableCompletedDispatchReplyRetry(t *testing.T) {
+	f := newAgenticFixture(t, "auto")
+	f.passFirstStage()
+	f.reconcile(t, f.command(100, "skip-agentic-mode"))
+	completed := f.gh.checks[0]
+	f.gh.failCommentAfterWrite = true
+	command := f.command(200, "agentic-mode")
+	require.NoError(t, f.a.reconcilePull(context.Background(), f.work, command), "confirmation is best-effort after a completed mutation")
+	f.reconcile(t, command)
+	require.False(t, hasAgenticLabel(&f.gh.pr, agenticSkipLabel))
+	require.Equal(t, []github.CheckRun{completed}, f.gh.checks)
+	require.True(t, f.state().waitingUntil.IsZero())
+}
+
+func TestAgenticDeferredRestoreRetainsTraditionalCommands(t *testing.T) {
+	for _, mode := range []string{"auto", "manual", "lgtm"} {
+		for _, origin := range []string{"skip", "timeout", "timeout-mark"} {
+			for _, restart := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/restart=%t", mode, origin, restart), func(t *testing.T) {
+					f := newAgenticFixture(t, mode)
+					f.passFirstStage()
+					if origin == "skip" {
+						f.reconcile(t, f.command(100, "skip-agentic-mode"))
+					} else {
+						f.reconcile(t, nil)
+						f.now = f.state().waitingUntil
+						f.reconcile(t, nil)
+					}
+					if !f.state().dispatched {
+						command := "remaining"
+						if origin == "timeout-mark" {
+							command = "mark-pipeline-gate"
+						}
+						f.reconcile(t, f.command(200, command))
+					}
+					completed := f.gh.checks[0]
+					require.Equal(t, traditionalCheckTitle, completed.Output.Title, "traditional ownership must survive a controller restart")
+					f.reconcile(t, f.command(300, "agentic-mode"))
+					require.Contains(t, f.gh.comments[len(f.gh.comments)-1].Body, "next HEAD SHA")
+					if restart {
+						f.a.states = nil
+					}
+					f.reconcile(t, nil)
+					require.True(t, f.state().traditionalMode())
+					require.False(t, f.state().optOut)
+					f.reconcile(t, f.command(400, "agentic-mode"))
+					require.Contains(t, f.gh.comments[len(f.gh.comments)-1].Body, "next HEAD SHA")
+					require.Equal(t, []github.CheckRun{completed}, f.gh.checks)
+					statuses := f.gh.statusWrites
+					f.reconcile(t, f.command(500, "remaining"))
+					require.Contains(t, f.gh.comments[len(f.gh.comments)-1].Body, "already been scheduled")
+					require.Equal(t, statuses, f.gh.statusWrites)
+					chai := f.command(600, "mark-pipeline-gate "+f.gh.pr.Head.SHA)
+					chai.User.Login = "chai[bot]"
+					f.reconcile(t, chai)
+					require.Contains(t, f.gh.comments[len(f.gh.comments)-1].Body, "traditional scheduling owns this revision")
+					require.Equal(t, []github.CheckRun{completed}, f.gh.checks)
+					f.reconcile(t, f.command(700, "required"))
+					require.Contains(t, f.gh.comments[len(f.gh.comments)-1].Body, "/test e2e")
+					require.Equal(t, statuses+1, f.gh.statusWrites)
+					f.gh.pr.Head.SHA = strings.Repeat("b", 40)
+					f.a.reader = newFakePJLister()
+					f.reconcile(t, f.command(800, "required"))
+					require.False(t, f.state().traditionalMode(), "the next revision returns to agentic ownership")
+					require.Contains(t, f.gh.comments[len(f.gh.comments)-1].Body, "not queued")
+					require.True(t, f.state().waitingUntil.IsZero())
+				})
+			}
+		}
+	}
+}
+
+func TestAgenticConfirmationFailureDoesNotReplayModeChange(t *testing.T) {
+	for _, push := range []bool{false, true} {
+		t.Run(fmt.Sprintf("push=%t", push), func(t *testing.T) {
+			f := newAgenticFixture(t, "manual")
+			f.passFirstStage()
+			f.reconcile(t, nil)
+			skip := f.command(100, "skip-agentic-mode")
+			f.gh.failCommentAfterWrite = true
+			f.reconcile(t, skip)
+			require.True(t, hasAgenticLabel(&f.gh.pr, agenticSkipLabel))
+			require.Equal(t, skip.ID, f.state().lastCommand)
+			f.gh.pr.Labels = nil
+			if push {
+				f.gh.pr.Head.SHA = strings.Repeat("b", 40)
+				f.passFirstStage()
+			}
+			f.reconcile(t, skip)
+			require.False(t, hasAgenticLabel(&f.gh.pr, agenticSkipLabel), "a handled skip cannot overwrite a later manual label removal")
+			require.False(t, f.state().traditionalMode())
+			require.Equal(t, agenticCheckTitle, f.gh.checks[len(f.gh.checks)-1].Output.Title)
+		})
+	}
+}
+
+func TestAgenticDeferredRestoreRerunFailurePreservesOwnershipAfterRestart(t *testing.T) {
+	for _, failure := range []string{"comment", "completion"} {
+		t.Run(failure, func(t *testing.T) {
+			f := newAgenticFixture(t, "manual")
+			f.passFirstStage()
+			f.reconcile(t, f.command(100, "skip-agentic-mode"))
+			f.reconcile(t, f.command(200, "remaining"))
+			f.reconcile(t, f.command(300, "agentic-mode"))
+			if failure == "comment" {
+				f.gh.failCommentAfterWrite = true
+			} else {
+				f.gh.afterCheckWrite = func(check github.CheckRun) {
+					if check.Status == "in_progress" {
+						f.gh.failCheck = true
+					}
+				}
+			}
+			require.Error(t, f.a.reconcilePull(t.Context(), f.work, f.command(400, "required")))
+			require.NotEqual(t, "success", f.gh.checks[0].Conclusion)
+			require.Equal(t, traditionalRerunCheckTitle, f.gh.checks[0].Output.Title)
+			f.gh.failCheck, f.gh.afterCheckWrite = false, nil
+			f.a.states = nil
+			f.reconcile(t, nil)
+			require.True(t, f.state().traditionalMode())
+			require.Len(t, f.gh.checks, 1, "a rerun failure must not signal fresh agentic readiness for the same HEAD")
+			require.True(t, f.state().waitingUntil.IsZero())
+			f.reconcile(t, f.command(500, "required"))
+			require.Equal(t, "success", f.gh.checks[0].Conclusion)
+			require.Equal(t, traditionalRerunCheckTitle, f.gh.checks[0].Output.Title)
+		})
+	}
+}
+
+func TestAgenticIncompleteOptOutRemovalAcrossRestart(t *testing.T) {
+	f := newAgenticFixture(t, "manual")
+	f.passFirstStage()
+	f.reconcile(t, nil)
+	f.reconcile(t, f.command(100, "skip-agentic-mode"))
+	require.Equal(t, "queued", f.gh.checks[0].Status)
+	require.Equal(t, traditionalCheckTitle, f.gh.checks[0].Output.Title)
+	f.gh.pr.Labels = nil
+	f.a.states = nil
+	f.reconcile(t, nil)
+	require.False(t, f.state().traditionalMode(), "removing an incomplete opt-out must restore agentic readiness, even after restart")
+	require.Len(t, f.gh.checks, 2)
+	require.Equal(t, agenticCheckTitle, f.gh.checks[1].Output.Title)
+	require.False(t, f.state().waitingUntil.IsZero())
+}
+
+func TestAgenticRestoreAfterTraditionalDispatchFailure(t *testing.T) {
+	for _, historical := range []bool{false, true} {
+		for _, restore := range []string{"command", "label-removal"} {
+			for _, failure := range []string{"comment", "completion"} {
+				for _, restart := range []bool{false, true} {
+					t.Run(fmt.Sprintf("historical=%t/%s/%s/restart=%t", historical, restore, failure, restart), func(t *testing.T) {
+						f := newAgenticFixture(t, "manual")
+						f.passFirstStage()
+						f.reconcile(t, f.command(100, "skip-agentic-mode"))
+						if historical {
+							f.reconcile(t, f.command(200, "remaining"))
+							if restore == "command" {
+								f.reconcile(t, f.command(300, "agentic-mode"))
+							}
+						}
+						if failure == "comment" {
+							f.gh.failCommentAfterWrite = true
+						} else {
+							f.gh.afterCheckWrite = func(check github.CheckRun) {
+								if check.Status == "in_progress" {
+									f.gh.failCheck = true
+								}
+							}
+						}
+						require.Error(t, f.a.reconcilePull(t.Context(), f.work, f.command(400, "required")))
+						gate := f.gh.checks[0]
+						f.gh.failCheck, f.gh.afterCheckWrite = false, nil
+						if restart {
+							f.a.states = nil
+						}
+						if restore == "command" {
+							f.reconcile(t, f.command(500, "agentic-mode"))
+						} else {
+							f.gh.pr.Labels = nil
+							f.reconcile(t, nil)
+						}
+						if !historical {
+							require.False(t, f.state().traditionalMode(), "an initial failed dispatch can restore agentic mode immediately")
+							require.Len(t, f.gh.checks, 2)
+							require.Equal(t, agenticCheckTitle, f.gh.checks[1].Output.Title)
+							return
+						}
+						require.True(t, f.state().traditionalMode(), "a failed rerun cannot erase earlier completed dispatch ownership")
+						require.False(t, f.state().dispatched, "historical completion is not success of the latest rerun")
+						require.False(t, f.state().ready)
+						require.Equal(t, []github.CheckRun{gate}, f.gh.checks)
+						require.Equal(t, traditionalRerunCheckTitle, gate.Output.Title)
+						if restore == "command" {
+							require.Contains(t, f.gh.comments[len(f.gh.comments)-1].Body, "rerun gate is unchanged")
+							require.NotContains(t, f.gh.comments[len(f.gh.comments)-1].Body, "dispatch is already complete")
+						}
+						f.reconcile(t, f.command(600, "mark-pipeline-gate"))
+						require.Equal(t, traditionalRerunCheckTitle, f.gh.checks[0].Output.Title, "human acknowledgment retains historical ownership")
+						f.a.states = nil
+						f.reconcile(t, nil)
+						require.True(t, f.state().traditionalMode())
+						f.gh.pr.Head.SHA = strings.Repeat("b", 40)
+						f.a.reader = newFakePJLister()
+						f.reconcile(t, nil)
+						require.False(t, f.state().traditionalMode(), "historical ownership does not carry over to the next revision")
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestAgenticManualOptOutKeepsDurableCompletedOwner(t *testing.T) {
+	for _, traditionalWrite := range []bool{false, true} {
+		for _, restart := range []bool{false, true} {
+			t.Run(fmt.Sprintf("traditional-write=%t/restart=%t", traditionalWrite, restart), func(t *testing.T) {
+				f := newAgenticFixture(t, "manual")
+				f.passFirstStage()
+				f.reconcile(t, nil)
+				f.reconcile(t, f.command(100, "mark-pipeline-gate"))
+				completed := f.gh.checks[0]
+				f.gh.pr.Labels = []github.Label{{Name: agenticSkipLabel}}
+				f.reconcile(t, nil)
+				if traditionalWrite {
+					f.reconcile(t, f.command(200, "required"))
+					completed = f.gh.checks[0]
+				}
+				f.gh.pr.Labels = nil
+				if restart {
+					f.a.states = nil
+				}
+				f.reconcile(t, nil)
+				require.Equal(t, traditionalWrite, f.state().traditionalMode(), "removal restores the check's actual durable owner, not transient label history")
+				require.True(t, f.state().dispatched)
+				require.True(t, f.state().ready)
+				require.Equal(t, []github.CheckRun{completed}, f.gh.checks, "removal cannot reset a completed gate or emit new readiness")
+				f.a.states = nil
+				f.reconcile(t, nil)
+				require.Equal(t, traditionalWrite, f.state().traditionalMode())
+			})
+		}
+	}
+}
+
+func TestAgenticHistoricalRerunRetargetClearsOwnership(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		t.Run(fmt.Sprintf("restart=%t", restart), func(t *testing.T) {
+			f := newAgenticFixture(t, "manual")
+			f.a.watcher.config.Orgs[0].Repos[0].Branches = []string{"main", "release"}
+			presubmits := f.a.configDataProvider.updatedPresubmits["org/repo"]
+			presubmits.alwaysRequired = append(presubmits.alwaysRequired, config.Presubmit{JobBase: config.JobBase{Name: "pull-ci-org-repo-release-unit"}, AlwaysRun: true})
+			f.a.configDataProvider.updatedPresubmits["org/repo"] = presubmits
+			f.passFirstStage()
+			f.reconcile(t, f.command(100, "skip-agentic-mode"))
+			f.reconcile(t, f.command(200, "remaining"))
+			f.reconcile(t, f.command(300, "agentic-mode"))
+			f.reconcile(t, f.command(400, "required"))
+			require.Equal(t, traditionalRerunCheckTitle, f.gh.checks[0].Output.Title)
+			f.gh.pr.Base.Ref = "release"
+			f.a.reader = newFakePJLister()
+			if restart {
+				f.a.states = nil
+			}
+			f.reconcile(t, nil)
+			require.False(t, f.state().traditionalMode(), "historical ownership cannot survive a change of target branch")
+			require.Len(t, f.gh.checks, 1)
+			require.Equal(t, "failure", f.gh.checks[0].Conclusion)
+			f.passFirstStage()
+			f.reconcile(t, nil)
+			require.Len(t, f.gh.checks, 2)
+			require.Equal(t, agenticCheckTitle, f.gh.checks[1].Output.Title)
+			require.False(t, f.state().traditionalMode())
+		})
+	}
+}
+
+func TestAgenticMutationFailureRemainsRetryable(t *testing.T) {
+	f := newAgenticFixture(t, "manual")
+	f.passFirstStage()
+	f.reconcile(t, nil)
+	f.reconcile(t, f.command(100, "mark-pipeline-gate"))
+	f.gh.failLabel = true
+	skip := f.command(200, "skip-agentic-mode")
+	require.Error(t, f.a.reconcilePull(context.Background(), f.work, skip))
+	require.Equal(t, 100, f.state().lastCommand)
+	require.False(t, hasAgenticLabel(&f.gh.pr, agenticSkipLabel))
+	require.NotEqual(t, "success", f.gh.checks[0].Conclusion, "failed ownership mutation must stay fail-closed")
+	f.gh.failLabel = false
+	f.reconcile(t, skip)
+	require.True(t, hasAgenticLabel(&f.gh.pr, agenticSkipLabel))
+	require.Equal(t, skip.ID, f.state().lastCommand)
+}
+
+func TestAgenticSharedSHAOwnershipFailsClosed(t *testing.T) {
+	for _, mode := range []string{"pending", "agentic-complete", "traditional-complete"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newAgenticFixture(t, "auto")
+			f.passFirstStage()
+			f.reconcile(t, nil)
+			switch mode {
+			case "agentic-complete":
+				f.reconcile(t, f.command(100, "mark-pipeline-gate"))
+			case "traditional-complete":
+				f.reconcile(t, f.command(100, "skip-agentic-mode"))
+			}
+			gate, attempts, statuses := f.gh.checks[0], f.gh.checkAttempts, f.gh.statusWrites
+			f.gh.pr.Number, f.work.number = 43, 43
+			f.gh.pr.Labels = nil
+			f.passFirstStage()
+			err := f.a.reconcilePull(t.Context(), f.work, nil)
+			require.ErrorContains(t, err, "different PR", "commit-scoped gates cannot safely be reused for another PR")
+			require.Equal(t, []github.CheckRun{gate}, f.gh.checks)
+			require.Equal(t, attempts, f.gh.checkAttempts)
+			require.Equal(t, statuses, f.gh.statusWrites)
+		})
+	}
 }
 
 func TestAgenticSkipInvalidatesCompletionBeforeTraditionalDispatch(t *testing.T) {
@@ -564,9 +941,9 @@ func TestAgenticFallbackManualCommandAndReenable(t *testing.T) {
 	require.Len(t, f.gh.statusUpdates, 1, "duplicate deltas must not reset contexts or repost /test")
 	f.reconcile(t, f.command(300, "agentic-mode"))
 	require.False(t, f.state().timedOut)
-	require.Len(t, f.gh.checks, 2)
-	require.Equal(t, "failure", f.gh.checks[0].Conclusion)
-	require.Equal(t, "queued", f.gh.checks[1].Status)
+	require.Len(t, f.gh.checks, 1)
+	require.Equal(t, "success", f.gh.checks[0].Conclusion)
+	require.True(t, f.state().waitingUntil.IsZero())
 }
 
 func TestAgenticFreshReadinessRetryDoesNotDuplicateCreation(t *testing.T) {
@@ -604,7 +981,7 @@ func TestAgenticPendingReadinessSurvivesRestartWithoutTimerRecovery(t *testing.T
 	require.Equal(t, "success", f.gh.checks[0].Conclusion)
 }
 
-func TestAgenticReenableRetiresLiveTraditionalGateBeforeFirstStage(t *testing.T) {
+func TestAgenticReenablePreservesCompletedDispatchWithoutFirstStageJobs(t *testing.T) {
 	f := newAgenticFixture(t, "auto")
 	f.reconcile(t, f.command(100, "skip-agentic-mode"))
 	f.passFirstStage()
@@ -612,14 +989,14 @@ func TestAgenticReenableRetiresLiveTraditionalGateBeforeFirstStage(t *testing.T)
 	require.Equal(t, "success", f.gh.checks[0].Conclusion)
 	f.a.reader = newFakePJLister() // First-stage jobs were cleaned before re-enable.
 	f.reconcile(t, f.command(200, "agentic-mode"))
-	require.Equal(t, "failure", f.gh.checks[0].Conclusion)
-	require.Len(t, f.gh.checks, 1, "fresh readiness must wait for first-stage success")
-	require.False(t, f.state().ready)
+	require.Equal(t, "success", f.gh.checks[0].Conclusion)
+	require.Len(t, f.gh.checks, 1, "completed dispatch must not need first-stage jobs again")
+	require.True(t, f.state().ready)
 	require.True(t, f.state().waitingUntil.IsZero())
 }
 
 func TestAgenticRetiredGateCannotAuthorizeReadinessAfterRestart(t *testing.T) {
-	f := newAgenticFixture(t, "auto")
+	f := newAgenticFixture(t, "manual")
 	f.passFirstStage()
 	f.reconcile(t, nil)
 	f.reconcile(t, f.command(100, "mark-pipeline-gate"))

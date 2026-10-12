@@ -251,11 +251,32 @@ Late comments do not reclaim dispatch, and late completion commands are rejected
 After Chai responds there is no completion timeout: use `/pipeline skip-agentic-mode` for recovery.
 
 - `/pipeline skip-agentic-mode` adds `pipeline-skip-agentic-mode`, persistent across pushes/restarts.
-- `/pipeline agentic-mode` restores supported agentic mode, invalidates old completion
-  and creates a fresh readiness signal after first-stage success. Already-agentic PRs are unchanged.
-- Actual mode switches invalidate previous completion; repeat commands preserve it.
+- `/pipeline agentic-mode` removes opt-out and restores supported agentic mode. If dispatch
+  is already complete for the current HEAD/base, its successful gate is preserved and
+  agentic readiness starts on the next revision. If traditional scheduling owns that
+  completed gate, `/pipeline required` and `/pipeline remaining` remain available
+  for that revision, including after restart.
+  Later traditional rerun failures do not erase this ownership: the existing gate
+  retains its failed/in-progress state and `Traditional pipeline rerun` title until
+  recovered. This title records earlier dispatch ownership, not current success.
+  Chai completion cannot take ownership back on the completed traditional revision.
+  An initial failed dispatch without earlier completion can still restore immediately.
+  Otherwise, a fresh readiness signal
+  is created after first-stage success. Already-agentic PRs are unchanged.
+- Manual opt-out label removal also preserves completed dispatch. Repeat commands preserve it.
+  A completed agentic gate keeps its agentic owner unless an actual traditional
+  dispatch or acknowledgment while opted out writes traditional ownership.
 - `/pipeline required` and `/pipeline remaining` are rejected, not queued, while agentic.
   `/pipeline auto` only sets the existing LGTM auto label. Running tests are never cancelled.
+- Mode commands and help accept LF or CRLF line endings; edited comments do not
+  execute mode changes. Confirmation replies are best-effort: a delivery failure
+  is logged and never replays a successful label mutation. Actual mutation failures
+  still use the normal bounded retry path.
+
+The pipeline gate is a commit-scoped GitHub check. Another PR on the exact same
+HEAD SHA cannot safely reuse its completion; the controller currently rejects that
+ownership conflict. Independent per-PR gates require a merge-gating policy change,
+not merely filtering check runs by their external ID.
 
 New HEAD/base resets the cycle. Timers and timeout fallback are memory-only and may
 be lost on restart; owned checks and PR opt-out labels remain. Existing completed

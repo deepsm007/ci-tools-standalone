@@ -10,7 +10,7 @@ const pipelineHelp = "Pipeline commands:\n\n" +
 	"- `/pipeline required` — rerun the traditional second-stage set.\n" +
 	"- `/pipeline remaining` — run missing second-stage tests.\n" +
 	"- `/pipeline auto` — enable automatic dispatch in LGTM mode.\n" +
-	"- `/pipeline agentic-mode` — restore configured agentic mode; already-agentic PRs are unchanged.\n" +
+	"- `/pipeline agentic-mode` — restore configured agentic mode; completed dispatch and traditional rerun commands stay unchanged until the next HEAD SHA.\n" +
 	"- `/pipeline skip-agentic-mode` — use traditional scheduling for this PR, including future pushes.\n" +
 	"- `/pipeline mark-pipeline-gate [<HEAD>]` — mark `ci/pipeline-gate` green; omitted HEAD means current HEAD. Does not run tests or override results."
 
@@ -21,8 +21,12 @@ var (
 
 type pipelineCommand struct{ name, head string }
 
+func normalizePipelineComment(body string) string {
+	return strings.ReplaceAll(body, "\r\n", "\n")
+}
+
 func parsePipelineCommand(body string) (pipelineCommand, bool) {
-	matches := pipelineCommandRE.FindAllStringSubmatch(body, -1)
+	matches := pipelineCommandRE.FindAllStringSubmatch(normalizePipelineComment(body), -1)
 	if len(matches) != 1 {
 		return pipelineCommand{}, false
 	}

@@ -11,6 +11,8 @@ import (
 )
 
 const pipelineGate = "ci/pipeline-gate"
+const traditionalCheckTitle = "Pipeline dispatch"
+const traditionalRerunCheckTitle = "Traditional pipeline rerun"
 const dispatchSuccessSummary = "Applicable second-stage tests were dispatched, already had runs, or were not required. Individual job contexts report test results."
 
 func dispatchOverrideSummary(commentID int) string {
@@ -49,7 +51,18 @@ func findPipelineCheck(gh pipelineCheckClient, appID int64, org, repo, sha strin
 	return gate, nil
 }
 
+// A rerun may fail after an earlier successful dispatch. Its title retains that
+// historical ownership without claiming that the current rerun succeeded.
+func traditionalRevisionOwner(gate *github.CheckRun) bool {
+	return gate.ID != 0 && (gate.Output.Title == traditionalRerunCheckTitle ||
+		(gate.Output.Title == traditionalCheckTitle && gate.Status == "completed" && gate.Conclusion == "success"))
+}
+
 func writePipelineCheck(gh pipelineCheckClient, appID int64, org, repo string, gate *github.CheckRun, next github.CheckRun, reopen bool) error {
+	if gate.ID != 0 && gate.ExternalID == next.ExternalID && next.Output.Title == traditionalCheckTitle &&
+		(gate.Output.Title == traditionalRerunCheckTitle || (traditionalRevisionOwner(gate) && next.Status != "completed")) {
+		next.Output.Title = traditionalRerunCheckTitle
+	}
 	if gate.ID == 0 {
 		id, err := gh.CreateCheckRun(org, repo, next)
 		if err != nil {
@@ -88,7 +101,7 @@ type dispatchChecks struct {
 func traditionalCheck(refs *v1.Refs, status, conclusion, summary string) github.CheckRun {
 	return github.CheckRun{Name: pipelineGate, HeadSHA: refs.Pulls[0].SHA,
 		ExternalID: pipelineExternalID(refs), Status: status, Conclusion: conclusion,
-		Output: github.CheckRunOutput{Title: "Pipeline dispatch", Summary: fmt.Sprintf("Pipeline for `%s` → `%s`.\n\n%s", refs.Pulls[0].SHA, refs.BaseRef, summary)}}
+		Output: github.CheckRunOutput{Title: traditionalCheckTitle, Summary: fmt.Sprintf("Pipeline for `%s` → `%s`.\n\n%s", refs.Pulls[0].SHA, refs.BaseRef, summary)}}
 }
 
 func (c *dispatchChecks) pending(refs *v1.Refs) error {
@@ -151,6 +164,10 @@ func (c *dispatchChecks) dispatch(refs *v1.Refs, hasJobs bool, post func() error
 }
 
 func (c *dispatchChecks) markGate(refs *v1.Refs, commentID int) error {
+	return c.markGateWithTitle(refs, commentID, "")
+}
+
+func (c *dispatchChecks) markGateWithTitle(refs *v1.Refs, commentID int, title string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	gate, err := findPipelineCheck(c.gh, c.appID, refs.Org, refs.Repo, refs.Pulls[0].SHA)
@@ -161,6 +178,9 @@ func (c *dispatchChecks) markGate(refs *v1.Refs, commentID int) error {
 		return fmt.Errorf("no active owned pipeline gate for the current HEAD/base")
 	}
 	next := traditionalCheck(refs, "completed", "success", dispatchOverrideSummary(commentID))
-	next.Output.Title = gate.Output.Title
+	if title == "" {
+		title = gate.Output.Title
+	}
+	next.Output.Title = title
 	return writePipelineCheck(c.gh, c.appID, refs.Org, refs.Repo, gate, next, false)
 }

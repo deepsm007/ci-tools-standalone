@@ -6,25 +6,80 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
+	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/prow/pkg/github"
 )
 
 func TestPipelineHelpDoesNotReconcile(t *testing.T) {
-	for _, action := range []github.IssueCommentEventAction{github.IssueCommentActionCreated, github.IssueCommentActionEdited} {
-		f := newAgenticFixture(t, "auto")
-		cw := &clientWrapper{ghc: f.gh, agentic: f.a}
-		cw.handleIssueComment(f.a.logger, github.IssueCommentEvent{Action: action, Repo: f.gh.pr.Base.Repo,
-			Issue: github.Issue{Number: 42, PullRequest: &struct{}{}}, Comment: github.IssueComment{Body: "/pipeline help"}})
-		if action == github.IssueCommentActionCreated {
-			require.Len(t, f.gh.comments, 1)
-			for _, command := range []string{"help", "required", "remaining", "auto", "agentic-mode", "skip-agentic-mode", "mark-pipeline-gate"} {
-				require.Contains(t, f.gh.comments[0].Body, "/pipeline "+command)
+	for _, body := range []string{"/pipeline help", "\r\n/pipeline help\r\n\r\n"} {
+		for _, action := range []github.IssueCommentEventAction{github.IssueCommentActionCreated, github.IssueCommentActionEdited} {
+			f := newAgenticFixture(t, "auto")
+			cw := &clientWrapper{ghc: f.gh, agentic: f.a}
+			cw.handleIssueComment(f.a.logger, github.IssueCommentEvent{Action: action, Repo: f.gh.pr.Base.Repo,
+				Issue: github.Issue{Number: 42, PullRequest: &struct{}{}}, Comment: github.IssueComment{Body: body}})
+			if action == github.IssueCommentActionCreated {
+				require.Len(t, f.gh.comments, 1)
+				for _, command := range []string{"help", "required", "remaining", "auto", "agentic-mode", "skip-agentic-mode", "mark-pipeline-gate"} {
+					require.Contains(t, f.gh.comments[0].Body, "/pipeline "+command)
+				}
+			} else {
+				require.Empty(t, f.gh.comments)
 			}
-		} else {
-			require.Empty(t, f.gh.comments)
+			require.Zero(t, f.gh.getPullRequestCalls)
+			require.Empty(t, f.gh.checks)
 		}
-		require.Zero(t, f.gh.getPullRequestCalls)
-		require.Empty(t, f.gh.checks)
+	}
+}
+
+func TestParsePipelineCommandLineEndings(t *testing.T) {
+	for _, tc := range []struct {
+		body string
+		name string
+	}{
+		{"/pipeline agentic-mode", "agentic-mode"},
+		// The two restore comment bodies originally ignored on PR #5462.
+		{"\r\n/pipeline agentic-mode\r\n\r\n", "agentic-mode"},
+		{"/pipeline agentic-mode\r\n\r\n", "agentic-mode"},
+		{"Explanation\r\n/pipeline skip-agentic-mode\r\n", "skip-agentic-mode"},
+		{"/pipeline mark-pipeline-gate " + strings.Repeat("a", 40) + "\r\n", "mark-pipeline-gate"},
+		{"/pipeline agentic-mode\r", ""},
+		{"/pipeline agentic-mode extra\r\n", ""},
+		{"/pipeline agentic-mode " + strings.Repeat("a", 40) + "\r\n", ""},
+		{"/pipeline mark-pipeline-gate short\r\n", ""},
+		{"/pipeline agentic-mode\r\n/pipeline skip-agentic-mode\r\n", ""},
+		{"/pipeline required\n/pipeline remaining\r\n", ""},
+		{"/pipeline help\r\n", ""},
+	} {
+		t.Run(tc.body, func(t *testing.T) {
+			command, ok := parsePipelineCommand(tc.body)
+			require.Equal(t, tc.name != "", ok)
+			require.Equal(t, tc.name, command.name)
+		})
+	}
+}
+
+func TestAgenticModeCRLFCommentEvents(t *testing.T) {
+	for _, body := range []string{"\r\n/pipeline agentic-mode\r\n\r\n", "/pipeline agentic-mode\r\n\r\n"} {
+		for _, action := range []github.IssueCommentEventAction{github.IssueCommentActionCreated, github.IssueCommentActionEdited} {
+			t.Run(string(action)+"/"+body, func(t *testing.T) {
+				f := newAgenticFixture(t, "manual")
+				f.reconcile(t, f.command(100, "skip-agentic-mode"))
+				f.a.queue = workqueue.NewTypedRateLimitingQueue(workqueue.NewTypedItemExponentialFailureRateLimiter[agenticWork](0, 0))
+				defer f.a.queue.ShutDown()
+				cw := &clientWrapper{ghc: f.gh, agentic: f.a}
+				comment := f.command(200, "agentic-mode")
+				comment.Body = body
+				cw.handleIssueComment(f.a.logger, github.IssueCommentEvent{Action: action, Repo: f.gh.pr.Base.Repo,
+					Issue: github.Issue{Number: f.work.number, PullRequest: &struct{}{}}, Comment: *comment})
+				if action == github.IssueCommentActionCreated {
+					require.True(t, f.a.processNext(t.Context()))
+					require.False(t, hasAgenticLabel(&f.gh.pr, agenticSkipLabel))
+				} else {
+					require.Empty(t, f.a.inputs, "edited comments must not execute a mode change")
+					require.True(t, hasAgenticLabel(&f.gh.pr, agenticSkipLabel))
+				}
+			})
+		}
 	}
 }
 

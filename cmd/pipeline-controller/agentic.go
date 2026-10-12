@@ -38,10 +38,15 @@ type agenticState struct {
 	fresh        bool
 	timedOut     bool
 	optOut       bool
+	traditional  bool // Current revision ownership, independent of the next-push opt-out label.
 	dispatched   bool
 	lastCommand  int
 	waitingUntil time.Time
 	publishedAt  time.Time
+}
+
+func (s *agenticState) traditionalMode() bool {
+	return s.optOut || s.timedOut || s.traditional
 }
 
 type agenticController struct {
@@ -139,7 +144,7 @@ func pullRefs(org, repo string, pr *github.PullRequest) *v1.Refs {
 }
 
 func (a *agenticController) cancelResponseTimeout(s *agenticState, comment *github.IssueComment) {
-	if comment != nil && a.trustedChai(comment.User.Login) && comment.ID > 0 && s.ready && !s.optOut && !s.timedOut &&
+	if comment != nil && a.trustedChai(comment.User.Login) && comment.ID > 0 && s.ready && !s.traditionalMode() &&
 		!s.waitingUntil.IsZero() && !comment.CreatedAt.Before(s.publishedAt) && !comment.CreatedAt.After(s.waitingUntil) {
 		s.waitingUntil = time.Time{} // Any new Chai comment is a response, not dispatch completion.
 	}
@@ -185,7 +190,14 @@ func (a *agenticController) reconcilePull(ctx context.Context, work agenticWork,
 			}
 			fresh = true
 		}
-		s = &agenticState{head: pr.Head.SHA, base: pr.Base.Ref, fresh: fresh, gate: *gate}
+		lastCommand := 0
+		if s != nil {
+			lastCommand = s.lastCommand // A completed command is not replayed on a later push.
+		}
+		s = &agenticState{head: pr.Head.SHA, base: pr.Base.Ref, fresh: fresh, gate: *gate, lastCommand: lastCommand}
+		if !fresh && traditionalRevisionOwner(gate) {
+			s.traditional = true // Ownership survives a failed or in-progress traditional rerun too.
+		}
 		if !fresh && nativeAgenticReadiness(gate) {
 			s.ready = true // Native readiness/completion survives a lost in-memory timer.
 			s.dispatched = gate.Status == "completed" && gate.Conclusion == "success"
@@ -194,7 +206,9 @@ func (a *agenticController) reconcilePull(ctx context.Context, work agenticWork,
 	}
 	optOut := hasAgenticLabel(pr, agenticSkipLabel)
 	if s.optOut && !optOut {
-		s.ready, s.fresh, s.dispatched = false, true, false
+		if _, err := a.restoreAgenticMode(work, s, pr, false); err != nil {
+			return err
+		}
 	}
 	s.optOut = optOut
 	a.cancelResponseTimeout(s, comment)
@@ -203,7 +217,7 @@ func (a *agenticController) reconcilePull(ctx context.Context, work agenticWork,
 			return err
 		}
 	}
-	if s.optOut || s.timedOut {
+	if s.traditionalMode() {
 		s.waitingUntil = time.Time{}
 		return a.dispatchTraditional(ctx, work, s, pr, cfg)
 	}
@@ -226,6 +240,39 @@ func (a *agenticController) reconcilePull(ctx context.Context, work agenticWork,
 		return a.dispatchTraditional(ctx, work, s, pr, cfg)
 	}
 	return nil
+}
+
+// A completed dispatch belongs to the current revision regardless of its mode.
+// Removing opt-out must not signal Chai again or invalidate that completion.
+func (a *agenticController) restoreAgenticMode(work agenticWork, s *agenticState, pr *github.PullRequest, removeLabel bool) (bool, error) {
+	gate, err := findPipelineCheck(a.gh, a.appID, work.org, work.repo, pr.Head.SHA)
+	if err != nil {
+		return false, err
+	}
+	if gate.ID != 0 && !strings.HasPrefix(gate.ExternalID, pipelinePRIdentity(work.org, work.repo, pr.Number)+":") {
+		return false, fmt.Errorf("no active owned pipeline gate for this PR/revision")
+	}
+	current := gate.ID != 0 && gate.ExternalID == pipelineExternalID(pullRefs(work.org, work.repo, pr))
+	completed := current &&
+		gate.Status == "completed" && gate.Conclusion == "success"
+	deferred := current && (completed || traditionalRevisionOwner(gate))
+	if !deferred && gate.ID != 0 {
+		if err := a.retireCheck(work, *gate); err != nil {
+			return false, err
+		}
+	}
+	if removeLabel && s.optOut {
+		if err := a.gh.RemoveLabel(work.org, work.repo, work.number, agenticSkipLabel); err != nil {
+			return false, err
+		}
+	}
+	s.optOut, s.timedOut, s.dispatched = false, false, completed
+	s.traditional = current && traditionalRevisionOwner(gate)
+	s.ready, s.fresh, s.waitingUntil = completed, !deferred, time.Time{}
+	if deferred {
+		s.gate, s.publishedAt = *gate, time.Time{}
+	}
+	return deferred, nil
 }
 
 func (a *agenticController) retireCheck(work agenticWork, gate github.CheckRun) error {

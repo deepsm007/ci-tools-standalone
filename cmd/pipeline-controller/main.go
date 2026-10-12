@@ -329,7 +329,7 @@ func (cw *clientWrapper) handleLabelAddition(l *logrus.Entry, event github.PullR
 func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueCommentEvent) {
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
-	if event.Action == github.IssueCommentActionCreated && event.Issue.IsPullRequest() && pipelineHelpRE.MatchString(event.Comment.Body) {
+	if event.Action == github.IssueCommentActionCreated && event.Issue.IsPullRequest() && pipelineHelpRE.MatchString(normalizePipelineComment(event.Comment.Body)) {
 		if cw.agentic != nil && cw.agentic.trustedChai(event.Comment.User.Login) {
 			cw.agentic.handleIssueComment(l, event)
 		}
