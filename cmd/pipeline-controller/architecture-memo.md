@@ -22,12 +22,21 @@ agentic mode. Chai owns second-stage execution unless a response timeout or
   New HEAD/base requires fresh readiness and completion.
 - `/pipeline skip-agentic-mode` opts this PR into the existing traditional
   auto/manual/LGTM workflow. `/pipeline agentic-mode` restores agentic review
-  only when repository/branch configuration permits it, invalidating previous
-  completion and issuing a fresh readiness signal once first-stage tests pass.
+  only when repository/branch configuration permits it. Completed dispatch for
+  the current revision is preserved; agentic readiness resumes on the next
+  HEAD/base. An incomplete dispatch gets fresh readiness once first-stage tests pass.
+  Traditional rerun commands retain current-revision ownership across this deferred
+  restore and restart; the successful native check records that ownership.
+  Reopening that check retains historical ownership in its rerun title, even if the
+  latest rerun fails; current status still reports failure, not historical success.
   Already-agentic PRs receive confirmation only: no gate reset, timer restart or new analysis.
 - Persist opt-out as a PR label across pushes/restarts. Mode changes do not
-  cancel running jobs; actual mode switches invalidate previous completion.
+  cancel running jobs; restoring agentic mode preserves completed dispatch.
   Traditional dispatch still completes the renamed check automatically.
+- Keep successful command mutations separate from best-effort confirmation replies;
+  failed confirmation must not replay an old opt-out over a newer label choice.
+- Check runs are commit-scoped, not PR-scoped. Shared-SHA ownership conflicts stay
+  fail-closed until merge-gating policy can safely account for all affected PRs.
 
 ## Remove
 

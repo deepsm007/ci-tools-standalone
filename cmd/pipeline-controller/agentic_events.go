@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -22,11 +21,19 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 			return err
 		}
 	}
-	reply := func(message string) error { return a.gh.CreateComment(work.org, work.repo, work.number, message) }
+	reply := func(message string) error {
+		// Confirmation is not part of the operation: a lost response must not
+		// replay an applied mode change over a newer manual label choice.
+		s.lastCommand = comment.ID
+		if err := a.gh.CreateComment(work.org, work.repo, work.number, message); err != nil {
+			a.logger.WithError(err).WithField("pr", work.number).Warn("Pipeline command handled; confirmation could not be delivered")
+		}
+		return nil
+	}
 	var err error
 	switch command.name {
 	case "required", "remaining":
-		if !s.optOut && !s.timedOut {
+		if !s.traditionalMode() {
 			err = reply("The controller does not dispatch second-stage tests in agentic mode. Use `/pipeline skip-agentic-mode` first, then repeat this command. The request was not queued.")
 			break
 		}
@@ -53,7 +60,7 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 			}
 		}
 	case "skip-agentic-mode":
-		if !s.optOut && !s.timedOut {
+		if !s.traditionalMode() {
 			// Invalidate agentic completion before persisting the ownership change,
 			// including when GitHub applies the label but loses its response.
 			if err = a.checks.pendingWithReset(pullRefs(work.org, work.repo, pr), true); err != nil {
@@ -69,31 +76,25 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 			err = reply("Traditional pipeline scheduling is enabled for this PR and future pushes. Running tests are unchanged.")
 		}
 	case "agentic-mode":
-		if !s.optOut && !s.timedOut {
+		if !s.traditionalMode() {
 			err = reply("Agentic mode is already enabled. The gate and response timeout are unchanged.")
 			break
 		}
+		var deferred bool
+		deferred, err = a.restoreAgenticMode(work, s, pr, true)
 		if err == nil {
-			var gate *github.CheckRun
-			gate, err = findPipelineCheck(a.gh, a.appID, work.org, work.repo, pr.Head.SHA)
-			if err == nil && gate.ID != 0 {
-				if !strings.HasPrefix(gate.ExternalID, pipelinePRIdentity(work.org, work.repo, pr.Number)+":") {
-					err = fmt.Errorf("no active owned pipeline gate for this PR/revision")
-				} else {
-					err = a.retireCheck(work, *gate)
-				}
+			if deferred && s.dispatched && s.traditional {
+				err = reply("Agentic mode is enabled for the next HEAD SHA. Second-stage dispatch is already complete for this HEAD; its pipeline gate and running tests are unchanged.")
+			} else if deferred && s.dispatched {
+				err = reply("Agentic mode is restored. This HEAD already has a completed agentic gate; its ownership and running tests are unchanged. The next HEAD SHA will start fresh agentic readiness.")
+			} else if deferred {
+				err = reply("Agentic mode is enabled for the next HEAD SHA. Traditional scheduling still owns this HEAD; its rerun gate is unchanged. Use `/pipeline required` or `/pipeline remaining` to recover the traditional rerun.")
+			} else {
+				err = reply("Agentic mode is restored. First-stage success will create a fresh pending pipeline gate. Running tests are unchanged.")
 			}
 		}
-		if err == nil && s.optOut {
-			err = a.gh.RemoveLabel(work.org, work.repo, work.number, agenticSkipLabel)
-		}
-		if err == nil {
-			s.optOut, s.timedOut, s.dispatched = false, false, false
-			s.ready, s.fresh, s.waitingUntil = false, true, time.Time{}
-			err = reply("Agentic mode is restored. First-stage success will create a fresh pending pipeline gate. Running tests are unchanged.")
-		}
 	case "mark-pipeline-gate":
-		if chai && (s.optOut || s.timedOut) {
+		if chai && s.traditionalMode() {
 			err = reply("Agentic command rejected: traditional scheduling owns this revision. Do not start agentic dispatch unless agentic mode is restored.")
 			break
 		}
@@ -101,8 +102,8 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 			err = reply(fmt.Sprintf("Command rejected: HEAD `%s` is not the current PR HEAD `%s`.", command.head, pr.Head.SHA))
 			break
 		}
-		if s.optOut || s.timedOut {
-			err = a.checks.markGate(pullRefs(work.org, work.repo, pr), comment.ID)
+		if s.traditionalMode() {
+			err = a.checks.markGateWithTitle(pullRefs(work.org, work.repo, pr), comment.ID, traditionalCheckTitle)
 			if err == nil {
 				s.dispatched = true
 			}
