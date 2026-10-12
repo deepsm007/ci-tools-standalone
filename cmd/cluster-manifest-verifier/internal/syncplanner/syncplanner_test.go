@@ -139,6 +139,21 @@ func TestPlannerBuild(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "uncovered deleted file is ignored",
+			apps: map[string]argov1alpha1.Application{
+				"foo": {
+					ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+					Spec: argov1alpha1.ApplicationSpec{
+						Source: &argov1alpha1.ApplicationSource{Path: "clusters/build-clusters/foo"},
+					},
+				},
+			},
+			changes: []gitchanges.FileChange{
+				{Path: "clusters/app.ci/removed-app/deploy.yaml", Status: 'D'},
+			},
+			wantPlans: map[string]*Plan{},
+		},
+		{
 			name: "covered deleted file plans full sync",
 			apps: map[string]argov1alpha1.Application{
 				"foo": {

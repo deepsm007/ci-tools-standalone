@@ -54,6 +54,11 @@ func (p *Planner) Build(apps map[string]argov1alpha1.Application, changes []gitc
 			}
 		}
 		if !matched {
+			// Deleted app dirs are gone from the PR revision, so ApplicationSet
+			// generation yields no Application to match against.
+			if change.Status == 'D' {
+				continue
+			}
 			planErr = errors.Join(planErr, fmt.Errorf("file %q is not covered by any Application source path", change.Path))
 		}
 	}
