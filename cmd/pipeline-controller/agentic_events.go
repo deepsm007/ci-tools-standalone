@@ -21,24 +21,23 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 			return err
 		}
 	}
-	reply := func(message string) error {
+	reply := func(message string) {
 		// Confirmation is not part of the operation: a lost response must not
 		// replay an applied mode change over a newer manual label choice.
 		s.lastCommand = comment.ID
 		if err := a.gh.CreateComment(work.org, work.repo, work.number, message); err != nil {
 			a.logger.WithError(err).WithField("pr", work.number).Warn("Pipeline command handled; confirmation could not be delivered")
 		}
-		return nil
 	}
 	var err error
 	switch command.name {
 	case "required", "remaining":
 		if !s.traditionalMode() {
-			err = reply("The controller does not dispatch second-stage tests in agentic mode. Use `/pipeline skip-agentic-mode` first, then repeat this command. The request was not queued.")
+			reply("The controller does not dispatch second-stage tests in agentic mode. Use `/pipeline skip-agentic-mode` first, then repeat this command. The request was not queued.")
 			break
 		}
 		if command.name == "remaining" && s.dispatched {
-			err = reply("The second stage has already been scheduled for this HEAD; nothing further to trigger.")
+			reply("The second stage has already been scheduled for this HEAD; nothing further to trigger.")
 			break
 		}
 		mode := modeForce
@@ -52,7 +51,7 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 		}
 	case "auto":
 		if cfg.Trigger != "lgtm" {
-			err = reply("`/pipeline auto` is available only in LGTM mode.")
+			reply("`/pipeline auto` is available only in LGTM mode.")
 		} else if !hasAgenticLabel(pr, PipelineAutoLabel) {
 			err = a.gh.AddLabel(work.org, work.repo, work.number, PipelineAutoLabel)
 			if err == nil {
@@ -73,33 +72,33 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 		}
 		if err == nil {
 			s.optOut, s.waitingUntil = true, time.Time{}
-			err = reply("Traditional pipeline scheduling is enabled for this PR and future pushes. Running tests are unchanged.")
+			reply("Traditional pipeline scheduling is enabled for this PR and future pushes. Running tests are unchanged.")
 		}
 	case "agentic-mode":
 		if !s.traditionalMode() {
-			err = reply("Agentic mode is already enabled. The gate and response timeout are unchanged.")
+			reply("Agentic mode is already enabled. The gate and response timeout are unchanged.")
 			break
 		}
 		var deferred bool
 		deferred, err = a.restoreAgenticMode(work, s, pr, true)
 		if err == nil {
 			if deferred && s.dispatched && s.traditional {
-				err = reply("Agentic mode is enabled for the next HEAD SHA. Second-stage dispatch is already complete for this HEAD; its pipeline gate and running tests are unchanged.")
+				reply("Agentic mode is enabled for the next HEAD SHA. Second-stage dispatch is already complete for this HEAD; its pipeline gate and running tests are unchanged.")
 			} else if deferred && s.dispatched {
-				err = reply("Agentic mode is restored. This HEAD already has a completed agentic gate; its ownership and running tests are unchanged. The next HEAD SHA will start fresh agentic readiness.")
+				reply("Agentic mode is restored. This HEAD already has a completed agentic gate; its ownership and running tests are unchanged. The next HEAD SHA will start fresh agentic readiness.")
 			} else if deferred {
-				err = reply("Agentic mode is enabled for the next HEAD SHA. Traditional scheduling still owns this HEAD; its rerun gate is unchanged. Use `/pipeline required` or `/pipeline remaining` to recover the traditional rerun.")
+				reply("Agentic mode is enabled for the next HEAD SHA. Traditional scheduling still owns this HEAD; its rerun gate is unchanged. Use `/pipeline required` or `/pipeline remaining` to recover the traditional rerun.")
 			} else {
-				err = reply("Agentic mode is restored. First-stage success will create a fresh pending pipeline gate. Running tests are unchanged.")
+				reply("Agentic mode is restored. First-stage success will create a fresh pending pipeline gate. Running tests are unchanged.")
 			}
 		}
 	case "mark-pipeline-gate":
 		if chai && s.traditionalMode() {
-			err = reply("Agentic command rejected: traditional scheduling owns this revision. Do not start agentic dispatch unless agentic mode is restored.")
+			reply("Agentic command rejected: traditional scheduling owns this revision. Do not start agentic dispatch unless agentic mode is restored.")
 			break
 		}
 		if command.head != "" && command.head != pr.Head.SHA {
-			err = reply(fmt.Sprintf("Command rejected: HEAD `%s` is not the current PR HEAD `%s`.", command.head, pr.Head.SHA))
+			reply(fmt.Sprintf("Command rejected: HEAD `%s` is not the current PR HEAD `%s`.", command.head, pr.Head.SHA))
 			break
 		}
 		if s.traditionalMode() {
@@ -120,11 +119,11 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 			break
 		}
 		if !s.ready || (chai && !s.publishedAt.IsZero() && !comment.CreatedAt.IsZero() && comment.CreatedAt.Before(s.publishedAt)) {
-			err = reply("There is no active agentic readiness gate for this revision. Wait for first-stage success and repeat the command.")
+			reply("There is no active agentic readiness gate for this revision. Wait for first-stage success and repeat the command.")
 			break
 		}
 		if chai && !s.waitingUntil.IsZero() && comment.CreatedAt.After(s.waitingUntil) {
-			err = reply("Agentic completion rejected: the response timeout expired. Traditional scheduling owns this revision.")
+			reply("Agentic completion rejected: the response timeout expired. Traditional scheduling owns this revision.")
 			break
 		}
 		s.waitingUntil = time.Time{} // This is a response timeout, not a dispatch deadline.
