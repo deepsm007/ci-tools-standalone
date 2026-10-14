@@ -34,6 +34,7 @@ type fakeAgenticGitHub struct {
 	failStatus            bool
 	failCheck             bool
 	failCheckAfterCreate  bool
+	failCheckAfterUpdate  bool
 	failCommentAfterWrite bool
 	failLabel             bool
 	failLabelAfterWrite   bool
@@ -147,6 +148,10 @@ func (f *fakeAgenticGitHub) UpdateCheckRun(_, _ string, id int64, check github.C
 		f.checks[i] = old
 		if f.afterCheckWrite != nil {
 			f.afterCheckWrite(old)
+		}
+		if f.failCheckAfterUpdate {
+			f.failCheckAfterUpdate = false
+			return io.ErrUnexpectedEOF
 		}
 		return nil
 	}
@@ -816,9 +821,7 @@ func TestAgenticCommandRevisionAndTrust(t *testing.T) {
 			}
 			f.reconcile(t, command)
 			switch scenario {
-			case "early":
-				require.Empty(t, f.gh.checks)
-			case "optional-head", "explicit-head":
+			case "early", "optional-head", "explicit-head":
 				require.Equal(t, "success", f.gh.checks[0].Conclusion)
 			default:
 				require.NotEqual(t, "success", f.gh.checks[0].Conclusion)
@@ -995,7 +998,7 @@ func TestAgenticReenablePreservesCompletedDispatchWithoutFirstStageJobs(t *testi
 	require.True(t, f.state().waitingUntil.IsZero())
 }
 
-func TestAgenticRetiredGateCannotAuthorizeReadinessAfterRestart(t *testing.T) {
+func TestAgenticRetiredGateCannotAuthorizeChaiReadinessAfterRestart(t *testing.T) {
 	f := newAgenticFixture(t, "manual")
 	f.passFirstStage()
 	f.reconcile(t, nil)
@@ -1005,11 +1008,170 @@ func TestAgenticRetiredGateCannotAuthorizeReadinessAfterRestart(t *testing.T) {
 	f.reconcile(t, f.command(300, "agentic-mode"))
 	require.Equal(t, "failure", f.gh.checks[0].Conclusion)
 	f.a.states = nil
-	f.reconcile(t, f.command(400, "mark-pipeline-gate"))
+	mark := f.command(400, "mark-pipeline-gate")
+	mark.User.Login = "chai[bot]"
+	f.reconcile(t, mark)
 	ack := &github.IssueComment{ID: 500, Body: "Chai is reviewing this PR.",
 		User: github.User{Login: "chai[bot]"}, CreatedAt: f.now}
 	f.reconcile(t, ack)
 	require.Len(t, f.gh.checks, 1)
 	require.Equal(t, "failure", f.gh.checks[0].Conclusion)
 	require.False(t, f.state().ready)
+}
+
+func TestAgenticHumanMarkMissingOrRunningGate(t *testing.T) {
+	for _, mode := range []string{"auto", "manual", "lgtm"} {
+		for _, scenario := range []string{"missing-member", "missing-collaborator", "running", "missing-traditional", "lost-create-response"} {
+			t.Run(mode+"/"+scenario, func(t *testing.T) {
+				f := newAgenticFixture(t, mode)
+				if scenario == "missing-collaborator" {
+					f.gh.member, f.gh.collaborator = false, true
+				}
+				if scenario == "running" {
+					gate := traditionalCheck(pullRefs(f.work.org, f.work.repo, &f.gh.pr), "in_progress", "", "dispatching")
+					gate.Output.Title = agenticCheckTitle
+					_, err := f.gh.CreateCheckRun(f.work.org, f.work.repo, gate)
+					require.NoError(t, err)
+				}
+				if scenario == "missing-traditional" {
+					f.gh.pr.Labels = []github.Label{{Name: agenticSkipLabel}}
+				}
+				command := f.command(100, "mark-pipeline-gate "+f.gh.pr.Head.SHA)
+				if scenario == "lost-create-response" {
+					f.gh.failCheckAfterCreate = true
+					require.Error(t, f.a.reconcilePull(context.Background(), f.work, command))
+				}
+				f.reconcile(t, command)
+				require.Len(t, f.gh.checks, 1)
+				gate := f.gh.checks[0]
+				require.Equal(t, "completed", gate.Status)
+				require.Equal(t, "success", gate.Conclusion)
+				require.Equal(t, pipelineExternalID(pullRefs(f.work.org, f.work.repo, &f.gh.pr)), gate.ExternalID)
+				wantTitle := agenticCheckTitle
+				if scenario == "missing-traditional" {
+					wantTitle = traditionalCheckTitle
+				}
+				require.Equal(t, wantTitle, gate.Output.Title)
+				require.True(t, f.state().dispatched)
+				require.True(t, f.state().waitingUntil.IsZero())
+				f.passFirstStage()
+				f.now = f.now.Add(time.Hour)
+				f.reconcile(t, nil)
+				f.a.states = nil
+				f.reconcile(t, nil)
+				require.Equal(t, []github.CheckRun{gate}, f.gh.checks, "completion must not publish fresh readiness after reconciliation or restart")
+				require.True(t, f.state().dispatched)
+				require.True(t, f.state().waitingUntil.IsZero())
+				require.Zero(t, f.gh.statusWrites)
+				require.Empty(t, f.gh.comments, "marking must not dispatch tests or trigger fallback")
+			})
+		}
+	}
+}
+
+func TestAgenticMissingGateMarkRequiresTrustedHuman(t *testing.T) {
+	for _, scenario := range []string{"untrusted", "stale-head", "chai", "chai-stale-memory"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newAgenticFixture(t, "auto")
+			f.reconcile(t, nil)
+			command := f.command(100, "mark-pipeline-gate")
+			switch scenario {
+			case "untrusted":
+				f.gh.member = false
+			case "stale-head":
+				command.Body += " " + strings.Repeat("b", 40)
+			case "chai", "chai-stale-memory":
+				command.User.Login, f.gh.member = "chai[bot]", false
+				if scenario == "chai-stale-memory" {
+					f.state().ready = true
+				}
+			}
+			err := f.a.reconcilePull(context.Background(), f.work, command)
+			if scenario == "chai-stale-memory" {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Empty(t, f.gh.checks)
+			require.Zero(t, f.gh.checkAttempts)
+			require.Zero(t, f.gh.statusWrites)
+			for _, comment := range f.gh.comments {
+				require.NotContains(t, comment.Body, "/test ")
+			}
+		})
+	}
+}
+
+func TestAgenticChaiCannotMarkChangedGateWithStaleReadiness(t *testing.T) {
+	for _, scenario := range []string{"retired", "traditional", "wrong-base", "wrong-pr"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newAgenticFixture(t, "manual")
+			f.passFirstStage()
+			f.reconcile(t, nil)
+			switch scenario {
+			case "retired":
+				f.gh.checks[0].Status, f.gh.checks[0].Conclusion = "completed", "failure"
+			case "traditional":
+				f.gh.checks[0].Status, f.gh.checks[0].Conclusion = "completed", "success"
+				f.gh.checks[0].Output.Title = traditionalCheckTitle
+			case "wrong-base":
+				f.gh.checks[0].ExternalID += "-old"
+			case "wrong-pr":
+				f.gh.checks[0].ExternalID = "pipeline-controller:org/repo#99:main"
+			}
+			gate := f.gh.checks[0]
+			attempts := f.gh.checkAttempts
+			mark := f.command(100, "mark-pipeline-gate")
+			mark.User.Login, f.gh.member = "chai[bot]", false
+			require.Error(t, f.a.reconcilePull(context.Background(), f.work, mark))
+			require.Equal(t, attempts, f.gh.checkAttempts)
+			require.Equal(t, []github.CheckRun{gate}, f.gh.checks)
+			require.Zero(t, f.gh.statusWrites)
+			require.Empty(t, f.gh.comments)
+		})
+	}
+}
+
+func TestAgenticMarkUpdateFailurePreservesPersistedCompletionOrResponseTimeout(t *testing.T) {
+	for _, accepted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("accepted=%t", accepted), func(t *testing.T) {
+			f := newAgenticFixture(t, "auto")
+			f.passFirstStage()
+			f.reconcile(t, nil)
+			deadline := f.state().waitingUntil
+			f.gh.failCheck, f.gh.failCheckAfterUpdate = !accepted, accepted
+			require.Error(t, f.a.reconcilePull(context.Background(), f.work, f.command(100, "mark-pipeline-gate")))
+			require.Equal(t, deadline, f.state().waitingUntil, "an unconfirmed mark must preserve the response timeout")
+			require.False(t, f.state().dispatched)
+			persisted := f.gh.checks[0]
+			if accepted {
+				require.Equal(t, "success", persisted.Conclusion)
+			} else {
+				require.Equal(t, "queued", persisted.Status)
+			}
+			// No command retry arrives: the ordinary timeout reconciliation must
+			// honor the actual check rather than assume the update was rejected.
+			f.gh.failCheck = false
+			f.now = deadline.Add(time.Minute)
+			f.reconcile(t, nil)
+			if accepted {
+				require.Equal(t, []github.CheckRun{persisted}, f.gh.checks)
+				require.False(t, f.state().timedOut)
+				require.Zero(t, f.gh.statusWrites)
+				require.Empty(t, f.gh.comments)
+				f.a.states = nil
+				f.reconcile(t, nil)
+				require.Equal(t, []github.CheckRun{persisted}, f.gh.checks)
+				require.Empty(t, f.gh.comments)
+			} else {
+				require.True(t, f.state().timedOut)
+				require.Equal(t, traditionalCheckTitle, f.gh.checks[0].Output.Title)
+				require.Positive(t, f.gh.statusWrites)
+				require.Len(t, f.gh.comments, 1)
+				require.Contains(t, f.gh.comments[0].Body, "/test e2e")
+			}
+			require.True(t, f.state().dispatched)
+			require.True(t, f.state().waitingUntil.IsZero())
+		})
+	}
 }

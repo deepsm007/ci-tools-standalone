@@ -1,5 +1,7 @@
 # Agentic dispatch handoff
 
+Agentic Handoff is a closed beta available to a limited set of enrolled repositories.
+
 Proposal: pipeline-controller owns first-stage readiness and the merge gate in
 agentic mode. Chai owns second-stage execution unless a response timeout or
 `/pipeline skip-agentic-mode` hands dispatch back to the traditional workflow.
@@ -16,7 +18,14 @@ agentic mode. Chai owns second-stage execution unless a response timeout or
 - Chai owns second-stage selection and dispatch. It ensures selected job
   contexts block merging before marking the gate; success does not mean
   tests passed. Pipeline-controller neither reads plans nor verifies job lists.
-- `/pipeline mark-pipeline-gate [<HEAD>]` completes the active check. Reject a
+- `/pipeline mark-pipeline-gate [<HEAD>]` completes the active check, including
+  running checks. Trusted organization members and repository collaborators may
+  also create a missing completed/success gate for older enrolled PRs. Agentic
+  completion persists with agentic ownership and suppresses fresh readiness or
+  timeout fallback for that revision, including after restart. Marking neither
+  dispatches tests nor writes job contexts. Configured Chai must still have an
+  existing active readiness gate and satisfy timing and ownership checks; it
+  cannot backfill missing gates. Reject a
   supplied HEAD that differs from the current PR HEAD; omitted HEAD targets
   current HEAD when processed. Chai should supply HEAD to avoid repush races.
   New HEAD/base requires fresh readiness and completion.

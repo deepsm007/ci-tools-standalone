@@ -239,3 +239,53 @@ func TestTraditionalGreenCheckNoWork(t *testing.T) {
 		})
 	}
 }
+
+func TestMarkPipelineGateOwnership(t *testing.T) {
+	for _, scenario := range []string{"missing", "running", "rerun", "other-app", "other-pr", "other-base", "other-head", "strict-missing"} {
+		t.Run(scenario, func(t *testing.T) {
+			refs := makeTriggerPJ(strings.Repeat("a", 40)).Spec.Refs
+			gate := traditionalCheck(refs, "in_progress", "", "running dispatch")
+			gate.ID, gate.App.ID = 1, 101
+			switch scenario {
+			case "rerun":
+				gate.Output.Title = traditionalRerunCheckTitle
+			case "other-app":
+				gate.App.ID = 202
+			case "other-pr":
+				gate.ExternalID = "pipeline-controller:other/repo#9:" + refs.BaseRef
+			case "other-base":
+				gate.ExternalID += "-old"
+			case "other-head":
+				gate.HeadSHA = strings.Repeat("b", 40)
+			}
+			gh := &fakeAgenticGitHub{}
+			if scenario != "missing" && scenario != "strict-missing" {
+				gh.checks = []github.CheckRun{gate}
+			}
+			checks := &dispatchChecks{gh: gh, appID: 101}
+			marked, err := checks.markGateCheck(refs, 500, "", scenario != "strict-missing")
+			if scenario == "other-pr" || scenario == "other-base" || scenario == "strict-missing" {
+				require.Error(t, err)
+				require.Zero(t, gh.checkAttempts)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, "completed", marked.Status)
+				require.Equal(t, "success", marked.Conclusion)
+				require.Equal(t, refs.Pulls[0].SHA, marked.HeadSHA)
+				require.Equal(t, pipelineExternalID(refs), marked.ExternalID)
+				require.Equal(t, int64(101), marked.App.ID)
+				require.NotEmpty(t, marked.Output.Title)
+				if scenario == "running" || scenario == "rerun" {
+					require.Len(t, gh.checks, 1)
+					require.Equal(t, gate.Output.Title, marked.Output.Title)
+				}
+				if scenario == "other-app" || scenario == "other-head" {
+					require.Equal(t, gate, gh.checks[0], "leave other apps and revisions unchanged")
+					require.Len(t, gh.checks, 2)
+				}
+			}
+			require.Zero(t, gh.statusWrites)
+			require.Empty(t, gh.comments)
+		})
+	}
+}
