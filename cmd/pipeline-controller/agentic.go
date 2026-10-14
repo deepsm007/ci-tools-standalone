@@ -236,6 +236,19 @@ func (a *agenticController) reconcilePull(ctx context.Context, work agenticWork,
 		}
 	}
 	if !s.waitingUntil.IsZero() && !a.currentTime().Before(s.waitingUntil) {
+		// A completion update may have reached GitHub even when its response
+		// and subsequent command retries were lost. Confirm persisted ownership
+		// before a response timeout can overwrite that success and dispatch tests.
+		gate, err := findPipelineCheck(a.gh, a.appID, work.org, work.repo, s.head)
+		if err != nil {
+			return err
+		}
+		if gate.HeadSHA == s.head && gate.ExternalID == pipelineExternalID(pullRefs(work.org, work.repo, pr)) &&
+			gate.Status == "completed" && gate.Conclusion == "success" && !traditionalRevisionOwner(gate) {
+			s.gate, s.ready, s.dispatched, s.fresh = *gate, true, true, false
+			s.waitingUntil = time.Time{}
+			return nil
+		}
 		s.timedOut, s.waitingUntil = true, time.Time{}
 		return a.dispatchTraditional(ctx, work, s, pr, cfg)
 	}

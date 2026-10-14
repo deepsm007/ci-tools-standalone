@@ -118,7 +118,7 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 		if err != nil {
 			break
 		}
-		if !s.ready || (chai && !s.publishedAt.IsZero() && !comment.CreatedAt.IsZero() && comment.CreatedAt.Before(s.publishedAt)) {
+		if chai && (!s.ready || (!s.publishedAt.IsZero() && !comment.CreatedAt.IsZero() && comment.CreatedAt.Before(s.publishedAt))) {
 			reply("There is no active agentic readiness gate for this revision. Wait for first-stage success and repeat the command.")
 			break
 		}
@@ -126,10 +126,17 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 			reply("Agentic completion rejected: the response timeout expired. Traditional scheduling owns this revision.")
 			break
 		}
-		s.waitingUntil = time.Time{} // This is a response timeout, not a dispatch deadline.
-		err = a.checks.markGate(pullRefs(work.org, work.repo, pr), comment.ID)
+		// Preserve an existing owner title; a human backfill belongs to the
+		// agentic workflow and must survive reconciliation and restart.
+		title := s.gate.Output.Title
+		if title == "" {
+			title = agenticCheckTitle
+		}
+		var gate *github.CheckRun
+		gate, err = a.checks.markGateCheck(pullRefs(work.org, work.repo, pr), comment.ID, title, !chai)
 		if err == nil {
-			s.gate.Status, s.gate.Conclusion = "completed", "success"
+			s.gate, s.ready, s.dispatched, s.fresh = *gate, true, true, false
+			s.waitingUntil = time.Time{} // This is a response timeout, not a dispatch deadline.
 		}
 	}
 	if err == nil {

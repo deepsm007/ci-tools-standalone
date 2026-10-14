@@ -127,9 +127,12 @@ func TestTraditionalMarkPipelineGate(t *testing.T) {
 			cw.handleIssueComment(logrus.NewEntry(logrus.New()), event)
 			require.Equal(t, foreign, gh.checks[0])
 			switch scenario {
-			case "missing-gate":
-				require.Len(t, gh.checks, 1, "mark must not create a new successful gate")
-			case "member", "collaborator", "explicit-head":
+			case "member", "collaborator", "explicit-head", "missing-gate":
+				require.Len(t, gh.checks, 2)
+				require.Equal(t, traditionalCheckTitle, gh.checks[1].Output.Title)
+				require.Equal(t, pipelineExternalID(refs), gh.checks[1].ExternalID)
+				require.Equal(t, refs.Pulls[0].SHA, gh.checks[1].HeadSHA)
+				require.Equal(t, "completed", gh.checks[1].Status)
 				require.Equal(t, "success", gh.checks[1].Conclusion)
 				require.Contains(t, gh.checks[1].Output.Summary, "comment 500")
 			default:

@@ -6,7 +6,8 @@ The Pipeline Controller is a tool that manages the execution of second-stage tes
 
 The Pipeline Controller operates in three distinct modes, each offering different levels of automation for triggering second-stage tests. Second-stage tests are tests that run after the initial required tests pass, typically integration tests, optional tests, or tests that depend on specific file changes.
 
-All modes support [agentic handoff](#agentic-handoff-chai). Otherwise,
+All modes support [agentic handoff](#agentic-handoff-chai), a closed beta
+available to a limited set of enrolled repositories. Otherwise,
 the normal-selection behavior below applies.
 The same opening notification is used with either selection method.
 
@@ -22,8 +23,11 @@ Empty retries leave successful checks unchanged. No additional flags, storage
 or startup scan are needed for traditional mode.
 
 `/pipeline help` lists all commands with short descriptions.
-`/pipeline mark-pipeline-gate [<HEAD>]` makes an existing `ci/pipeline-gate` green
-(organization members or repository collaborators; configured Chai in agentic mode).
+`/pipeline mark-pipeline-gate [<HEAD>]` makes `ci/pipeline-gate` green, including
+an existing running gate. Organization members and repository collaborators can
+also create a missing successful gate for older PRs on enrolled branches.
+Configured Chai in agentic mode can only complete an existing active readiness gate,
+subject to its response timing and revision ownership checks.
 A supplied full HEAD SHA must match the current PR HEAD; without it, the command
 targets the current HEAD when processed. It does not run tests or override their results.
 A new push starts a fresh pipeline.
@@ -224,6 +228,8 @@ If you manually trigger some second-stage tests (using `/test <job-name>`) in Au
 This complements manual triggers without re-running jobs that already started. If nothing remains to schedule because every applicable job already ran for the current HEAD, the controller says so rather than claiming no tests were triggered. To re-run a specific job that already ran, use `/test <job>`; to run the delta on demand, use `/pipeline remaining`.
 
 ## Agentic Handoff (Chai)
+
+Agentic Handoff is a **closed beta**, available to a limited set of enrolled repositories.
 
 Enable Chai in the main or LGTM enrollment configuration:
 

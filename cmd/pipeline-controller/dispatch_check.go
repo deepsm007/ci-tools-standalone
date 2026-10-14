@@ -168,19 +168,32 @@ func (c *dispatchChecks) markGate(refs *v1.Refs, commentID int) error {
 }
 
 func (c *dispatchChecks) markGateWithTitle(refs *v1.Refs, commentID int, title string) error {
+	_, err := c.markGateCheck(refs, commentID, title, true)
+	return err
+}
+
+// Only trusted humans may backfill a missing gate. Chai must complete the
+// existing readiness check for the current revision.
+func (c *dispatchChecks) markGateCheck(refs *v1.Refs, commentID int, title string, allowCreate bool) (*github.CheckRun, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	gate, err := findPipelineCheck(c.gh, c.appID, refs.Org, refs.Repo, refs.Pulls[0].SHA)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if gate.ID == 0 || gate.ExternalID != pipelineExternalID(refs) {
-		return fmt.Errorf("no active owned pipeline gate for the current HEAD/base")
+	if (!allowCreate && (!nativeAgenticReadiness(gate) || traditionalRevisionOwner(gate))) || (gate.ID != 0 &&
+		(gate.HeadSHA != refs.Pulls[0].SHA || gate.ExternalID != pipelineExternalID(refs))) {
+		return nil, fmt.Errorf("no active owned pipeline gate for the current HEAD/base")
 	}
 	next := traditionalCheck(refs, "completed", "success", dispatchOverrideSummary(commentID))
 	if title == "" {
 		title = gate.Output.Title
 	}
-	next.Output.Title = title
-	return writePipelineCheck(c.gh, c.appID, refs.Org, refs.Repo, gate, next, false)
+	if title != "" {
+		next.Output.Title = title
+	}
+	if err := writePipelineCheck(c.gh, c.appID, refs.Org, refs.Repo, gate, next, false); err != nil {
+		return nil, err
+	}
+	return gate, nil
 }
