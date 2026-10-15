@@ -222,6 +222,29 @@ func assertMapMissing(t *testing.T, m map[string]interface{}, key, ctx string) {
 	}
 }
 
+// archNodeAffinity builds a required nodeAffinity that pins a pod to the given
+// architecture(s) via kubernetes.io/arch In [...], mirroring how CI test pods
+// commonly convey their target architecture (rather than via nodeSelector).
+func archNodeAffinity(archs ...string) *corev1.Affinity {
+	return &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{
+					{
+						MatchExpressions: []corev1.NodeSelectorRequirement{
+							{
+								Key:      KubernetesArchLabelName,
+								Operator: corev1.NodeSelectorOpIn,
+								Values:   archs,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
 // --------------- mutation tests ---------------
 
 func TestMutatePod(t *testing.T) {
@@ -648,6 +671,88 @@ func TestMutatePod(t *testing.T) {
 		assertNoPatch(t, patches, "/spec/affinity")
 		assertNoPatch(t, patches, "/spec/initContainers")
 	})
+
+	// --- arch conveyed via nodeAffinity (the shape real CI test pods use) ---
+	t.Run("s390x test pod with arch in nodeAffinity gets arch-specific RuntimeClass", func(t *testing.T) {
+		pod := corev1.Pod{
+			Spec: corev1.PodSpec{
+				// No kubernetes.io/arch in nodeSelector — arch is expressed
+				// only via a required nodeAffinity, as real test pods do.
+				Affinity:   archNodeAffinity("s390x"),
+				Containers: []corev1.Container{{Name: "test"}},
+			},
+		}
+
+		patches := callMutatePod(t, pod, "ci-op-xxxx", "test-pod")
+
+		// The webhook must still route to the arch-specific RuntimeClass.
+		assertPatchStringValue(t, patches, "/spec/runtimeClassName", "ci-scheduler-runtime-tests-s390x")
+
+		// Arch-specific path: ci-workload must NOT be added to nodeSelector.
+		ns := nodeSelectorMap(t, patches)
+		assertMapMissing(t, ns, CiWorkloadLabelName, "nodeSelector")
+
+		// No hostname-preclusion affinity patch on the arch-specific path.
+		assertNoPatch(t, patches, "/spec/affinity")
+	})
+
+	t.Run("multi-arch nodeAffinity falls back to generic RuntimeClass", func(t *testing.T) {
+		// A job that can run on more than one architecture must NOT be pinned
+		// to an arch-specific RuntimeClass, even when arch RCs exist for those
+		// architectures.
+		pod := corev1.Pod{
+			Spec: corev1.PodSpec{
+				Affinity:   archNodeAffinity("s390x", "ppc64le"),
+				Containers: []corev1.Container{{Name: "test"}},
+			},
+		}
+
+		patches := callMutatePod(t, pod, "ci-op-xxxx", "test-pod")
+
+		// Ambiguous arch => generic path, with ci-workload nodeSelector.
+		assertPatchStringValue(t, patches, "/spec/runtimeClassName", "ci-scheduler-runtime-tests")
+		ns := nodeSelectorMap(t, patches)
+		assertMapHas(t, ns, CiWorkloadLabelName, string(PodClassTests), "nodeSelector")
+	})
+
+	// --- regression lock: build pod with arch in nodeSelector + no arch RC ---
+	t.Run("amd64 build pod with arch in nodeSelector keeps generic path", func(t *testing.T) {
+		// Real build pods carry kubernetes.io/arch in nodeSelector. With no
+		// amd64 arch-specific RuntimeClass, such a pod must stay on the generic
+		// path: standard RuntimeClass, ci-workload nodeSelector preserved, arch
+		// preserved, and the builds-only spot-instance preference intact.
+		pod := corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{CiBuildNameLabelName: "amd64-build"},
+			},
+			Spec: corev1.PodSpec{
+				NodeSelector: map[string]string{KubernetesArchLabelName: "amd64"},
+				Containers:   []corev1.Container{{Name: "build"}},
+			},
+		}
+
+		patches := callMutatePod(t, pod, "ci-op-amd64", "amd64-build-pod")
+
+		assertPatchStringValue(t, patches, "/spec/runtimeClassName", "ci-scheduler-runtime-builds")
+
+		ns := nodeSelectorMap(t, patches)
+		assertMapHas(t, ns, CiWorkloadLabelName, string(PodClassBuilds), "nodeSelector")
+		assertMapHas(t, ns, KubernetesArchLabelName, "amd64", "nodeSelector")
+
+		// The builds-only generic branch (spot-instance preference) must run.
+		affinityPatch := assertPatchExists(t, patches, "/spec/affinity")
+		affinityMap, ok := affinityPatch.Value.(map[string]interface{})
+		if !ok {
+			t.Fatalf("affinity value is %T, want map[string]interface{}", affinityPatch.Value)
+		}
+		nodeAffinity, ok := affinityMap["nodeAffinity"].(map[string]interface{})
+		if !ok {
+			t.Fatal("nodeAffinity not found in affinity patch")
+		}
+		if _, ok := nodeAffinity["preferredDuringSchedulingIgnoredDuringExecution"].([]interface{}); !ok {
+			t.Error("expected spot-instance preference on the generic amd64 build path")
+		}
+	})
 }
 
 // --------------- node mutation tests ---------------
@@ -895,6 +1000,44 @@ func TestMutateNode(t *testing.T) {
 		}
 		if taint["key"] != CIWorkerTaintKey {
 			t.Errorf("taint key = %v, want %s", taint["key"], CIWorkerTaintKey)
+		}
+	})
+
+	t.Run("stale ci-worker taint removed when no arch RuntimeClass", func(t *testing.T) {
+		// arm64 has no arch-specific RuntimeClass, so a node that still carries
+		// the ci-worker taint (e.g. an arch RC was created then deleted) must
+		// have it removed — otherwise generic-path pods, which do not tolerate
+		// ci-worker, would be stranded off the node.
+		node := corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "arm64-ci-node",
+				Labels: map[string]string{
+					CiWorkloadLabelName:     string(PodClassTests),
+					KubernetesArchLabelName: "arm64",
+				},
+				Annotations: map[string]string{
+					NodeDisableScaleDownAnnotationKey: "true",
+				},
+			},
+			Spec: corev1.NodeSpec{
+				Taints: []corev1.Taint{
+					{
+						Key:    CIWorkerTaintKey,
+						Value:  CIWorkerTaintValue,
+						Effect: corev1.TaintEffectNoSchedule,
+					},
+				},
+			},
+		}
+
+		patches := callMutateNode(t, node)
+
+		p := assertPatchExists(t, patches, "/spec/taints/0")
+		if p.Op != "remove" {
+			t.Errorf("expected remove op at /spec/taints/0, got %q", p.Op)
+		}
+		if p.Value != nil {
+			t.Errorf("remove patch should carry no value, got %v", p.Value)
 		}
 	})
 }

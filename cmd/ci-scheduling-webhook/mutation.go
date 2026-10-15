@@ -36,6 +36,51 @@ var (
 	cpuThreshold    = resource.MustParse("13")
 )
 
+// archFromNodeAffinity returns the single CPU architecture a pod is pinned to
+// via its REQUIRED nodeAffinity, or "" when it is not unambiguously pinned to
+// one architecture. CI test pods commonly express their target architecture
+// through a required nodeAffinity (kubernetes.io/arch In [...]) rather than
+// through spec.nodeSelector, so arch-specific RuntimeClass routing must consult
+// it in addition to the nodeSelector. Every OR-ed nodeSelectorTerm must
+// constrain kubernetes.io/arch, and all terms must agree on the same single
+// value; otherwise (an unconstrained term, or a multi-arch job such as
+// amd64/arm64) the result is "" and the caller uses the generic path.
+func archFromNodeAffinity(pod *corev1.Pod) string {
+	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil {
+		return ""
+	}
+	required := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	if required == nil || len(required.NodeSelectorTerms) == 0 {
+		return ""
+	}
+	archs := make(map[string]struct{})
+	for _, term := range required.NodeSelectorTerms {
+		termArchs := make(map[string]struct{})
+		for _, expr := range term.MatchExpressions {
+			if expr.Key == KubernetesArchLabelName && expr.Operator == corev1.NodeSelectorOpIn {
+				for _, v := range expr.Values {
+					termArchs[v] = struct{}{}
+				}
+			}
+		}
+		// A term that places no arch constraint leaves the pod free to land on
+		// any architecture, so it is not pinned to a single one.
+		if len(termArchs) == 0 {
+			return ""
+		}
+		for a := range termArchs {
+			archs[a] = struct{}{}
+		}
+	}
+	if len(archs) != 1 {
+		return ""
+	}
+	for a := range archs {
+		return a
+	}
+	return ""
+}
+
 func admissionReviewFromRequest(r *http.Request, deserializer runtime.Decoder) (*admissionv1.AdmissionReview, error) {
 	// Validate that the incoming content type is correct.
 	if r.Header.Get("Content-Type") != "application/json" {
@@ -358,7 +403,15 @@ func mutatePod(w http.ResponseWriter, r *http.Request) {
 		if nodeSelector == nil {
 			nodeSelector = make(map[string]string)
 		}
+		// CI pods convey their target architecture in one of two ways: build
+		// pods pin it via spec.nodeSelector[kubernetes.io/arch], while many
+		// test pods express it only through a required nodeAffinity
+		// (kubernetes.io/arch In [...]) and leave nodeSelector unset. Consult
+		// both so arch-specific routing works for either shape.
 		arch := nodeSelector[KubernetesArchLabelName]
+		if arch == "" {
+			arch = archFromNodeAffinity(&pod)
+		}
 		hasArchSpecificRC := arch != "" && archSpecificRuntimeClassExists(podClass, arch)
 
 		if hasArchSpecificRC {
@@ -621,9 +674,12 @@ func mutateNode(admissionReviewRequest *admissionv1.AdmissionReview, w http.Resp
 	patchEntries := make([]map[string]interface{}, 0)
 	addPatchEntry := func(op string, path string, value interface{}) {
 		patch := map[string]interface{}{
-			"op":    op,
-			"path":  path,
-			"value": value,
+			"op":   op,
+			"path": path,
+		}
+		// RFC 6902 "remove" operations carry no value member.
+		if op != "remove" {
+			patch["value"] = value
 		}
 		patchEntries = append(patchEntries, patch)
 	}
@@ -650,39 +706,51 @@ func mutateNode(admissionReviewRequest *admissionv1.AdmissionReview, w http.Resp
 			addPatchEntry("add", "/metadata/annotations/"+escapedKey, "true")
 		}
 
-		// Auto-taint CI nodes when arch-specific RuntimeClasses are
-		// deployed. This prevents non-CI workloads (operators, monitoring,
-		// etc.) from scheduling onto nodes where a single node must serve
-		// both builds and tests (e.g. s390x, ppc64le). The taint is
-		// arch-agnostic — the arch-specific RuntimeClass already handles
-		// architecture routing via nodeSelector; the taint's only job is
-		// to keep non-CI pods off. Whether an architecture needs this is
-		// determined entirely by the presence of arch-specific
-		// RuntimeClasses — no architectures are hardcoded.
+		// Auto-manage the CI-worker taint on CI nodes. When arch-specific
+		// RuntimeClasses are deployed for the node's architecture, the node
+		// must carry a NoSchedule taint so that non-CI workloads (operators,
+		// monitoring, etc.) cannot land on a node that a single architecture
+		// must share between builds and tests (e.g. s390x, ppc64le). The
+		// taint is arch-agnostic — the arch-specific RuntimeClass already
+		// handles architecture routing via nodeSelector; the taint's only job
+		// is to keep non-CI pods off. Whether an architecture needs this is
+		// determined entirely by the presence of arch-specific RuntimeClasses
+		// — no architectures are hardcoded.
+		//
+		// The taint is also removed again once no arch-specific RuntimeClass
+		// exists for the architecture: only the arch-specific RuntimeClasses
+		// tolerate ci-worker, so a stale taint left behind after their removal
+		// would strand generic-path pods, which do not tolerate it.
 		arch := labels[KubernetesArchLabelName]
-		if arch != "" && anyArchSpecificRuntimeClassExists(arch) {
-			hasTaint := false
-			for _, t := range node.Spec.Taints {
-				if t.Key == CIWorkerTaintKey {
-					hasTaint = true
-					break
-				}
+		shouldTaint := arch != "" && anyArchSpecificRuntimeClassExists(arch)
+
+		taintIndex := -1
+		for i, t := range node.Spec.Taints {
+			if t.Key == CIWorkerTaintKey {
+				taintIndex = i
+				break
 			}
-			if !hasTaint {
-				klog.Infof("Auto-tainting CI node %s (arch=%s) with %s=%s:NoSchedule",
-					nodeName, arch, CIWorkerTaintKey, CIWorkerTaintValue)
-				newTaint := map[string]interface{}{
-					"key":    CIWorkerTaintKey,
-					"value":  CIWorkerTaintValue,
-					"effect": string(corev1.TaintEffectNoSchedule),
-				}
-				if len(node.Spec.Taints) == 0 {
-					addPatchEntry("add", "/spec/taints", []interface{}{newTaint})
-				} else {
-					// RFC 6902: "-" appends to an existing array.
-					addPatchEntry("add", "/spec/taints/-", newTaint)
-				}
+		}
+
+		switch {
+		case shouldTaint && taintIndex < 0:
+			klog.Infof("Auto-tainting CI node %s (arch=%s) with %s=%s:NoSchedule",
+				nodeName, arch, CIWorkerTaintKey, CIWorkerTaintValue)
+			newTaint := map[string]interface{}{
+				"key":    CIWorkerTaintKey,
+				"value":  CIWorkerTaintValue,
+				"effect": string(corev1.TaintEffectNoSchedule),
 			}
+			if len(node.Spec.Taints) == 0 {
+				addPatchEntry("add", "/spec/taints", []interface{}{newTaint})
+			} else {
+				// RFC 6902: "-" appends to an existing array.
+				addPatchEntry("add", "/spec/taints/-", newTaint)
+			}
+		case !shouldTaint && taintIndex >= 0:
+			klog.Infof("Removing stale %s taint from CI node %s (arch=%s): no arch-specific RuntimeClass",
+				CIWorkerTaintKey, nodeName, arch)
+			addPatchEntry("remove", fmt.Sprintf("/spec/taints/%d", taintIndex), nil)
 		}
 	}
 
