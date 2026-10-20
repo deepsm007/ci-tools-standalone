@@ -139,12 +139,12 @@ func (app *dashboard) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 			Demo                   bool `json:"demo"`
 			RefreshIntervalSeconds int  `json:"refreshIntervalSeconds"`
 		}{app.opts.demo, 15})
-	case "/api/v1/dispatcher/state", "/api/v1/dispatcher/jobs", "/api/v1/dispatcher/overrides":
-		if app.opts.demo {
-			app.sample.serve(writer, request, time.Now().UTC())
-			return
-		}
-		app.proxyObservation(writer, request)
+	case "/api/v1/dispatcher/state":
+		app.proxyObservation(writer, request, "/observe/v1/state")
+	case "/api/v1/dispatcher/jobs":
+		app.proxyObservation(writer, request, "/observe/v1/jobs")
+	case "/api/v1/dispatcher/overrides":
+		app.proxyObservation(writer, request, "/observe/v1/overrides")
 	case "/api/v1/dispatcher/health":
 		app.serveHealth(writer, request)
 	case "/api/v1/diagnostics":
@@ -193,14 +193,11 @@ func (app *dashboard) fetch(request *http.Request, path, query string) ([]byte, 
 	if err != nil {
 		return nil, 0, err
 	}
-	target := app.opts.dispatcherURL + path
-	if query != "" {
-		target += "?" + query
-	}
-	upstream, err := http.NewRequestWithContext(request.Context(), http.MethodGet, target, nil)
+	upstream, err := http.NewRequestWithContext(request.Context(), http.MethodGet, app.opts.dispatcherURL+path, nil)
 	if err != nil {
 		return nil, 0, errors.New("could not prepare dispatcher request")
 	}
+	upstream.URL.RawQuery = query
 	upstream.Header.Set("Authorization", "Bearer "+token)
 	upstream.Header.Set("Accept", "application/json, text/plain")
 	response, err := app.client.Do(upstream)
@@ -221,8 +218,11 @@ func (app *dashboard) fetch(request *http.Request, path, query string) ([]byte, 
 }
 
 // proxyObservation preserves observation JSON and status without forwarding upstream headers.
-func (app *dashboard) proxyObservation(writer http.ResponseWriter, request *http.Request) {
-	path := "/observe/v1/" + strings.TrimPrefix(request.URL.Path, "/api/v1/dispatcher/")
+func (app *dashboard) proxyObservation(writer http.ResponseWriter, request *http.Request, path string) {
+	if app.opts.demo {
+		app.sample.serve(writer, request, time.Now().UTC())
+		return
+	}
 	query := ""
 	if path == "/observe/v1/jobs" {
 		query = jobsQuery(request.URL.Query())

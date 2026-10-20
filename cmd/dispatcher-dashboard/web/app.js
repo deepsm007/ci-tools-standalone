@@ -85,7 +85,12 @@ function stateBadge(state) { return badge(state || 'Not recorded', { Active: 'gr
 async function requestJSON(path, signal) {
   const response = await fetch(path, { signal, cache: 'no-store', credentials: 'same-origin', headers: { Accept: 'application/json' } });
   if (!response.ok) {
-    const error = new Error(`Request failed (${response.status})`);
+    let message = `Request failed (${response.status})`;
+    try {
+      const body = await response.json();
+      if (typeof body?.error === 'string' && body.error.trim()) message = body.error;
+    } catch { /* An unreadable or non-JSON error body keeps the status fallback. */ }
+    const error = new Error(message);
     error.status = response.status;
     if (response.status === 401 || response.status === 403) error.message = `Observation access denied (${response.status}). Check the server's upstream read-token configuration.`;
     if (response.status === 503) error.message = 'Observation is unavailable (503). The upstream policy or this observation endpoint may not be ready.';
@@ -237,16 +242,18 @@ function renderNotices() {
     const resource = resources.diagnostics;
     if (configError && !resource.data) notices.push(node('div', 'notice', configError));
     if (resource.error) notices.push(node('div', 'notice', `${resource.error}${resource.data ? ' Showing the last successful diagnostics; results may be stale.' : ''}`));
-    $('notices').replaceChildren(...notices); return;
+  } else {
+    if (configError) notices.push(node('div', 'notice', configError));
+    for (const key of ['state', ...(view === 'jobs' ? ['jobs'] : ['overrides', 'clusters'].includes(view) ? ['overrides'] : ['health'])]) {
+      const resource = resources[key];
+      if (resource.error) notices.push(node('div', 'notice', `${key === 'state' ? 'Policy' : key[0].toUpperCase() + key.slice(1)}: ${resource.error}${resource.data ? ' Showing the last successful observation; values may be stale.' : key === 'jobs' ? ' Submit Search to retry.' : ' Use Refresh to retry.'}`));
+    }
+    if (resources.state.data && !resources.state.data.ready) notices.push(node('div', 'notice', 'The serving policy is not ready. No placement or policy generation is available yet.'));
+    if (view === 'jobs' && paginationNotice) notices.push(node('div', 'notice info', paginationNotice));
   }
-  if (configError) notices.push(node('div', 'notice', configError));
-  for (const key of ['state', ...(view === 'jobs' ? ['jobs'] : ['overrides', 'clusters'].includes(view) ? ['overrides'] : ['health'])]) {
-    const resource = resources[key];
-    if (resource.error) notices.push(node('div', 'notice', `${key === 'state' ? 'Policy' : key[0].toUpperCase() + key.slice(1)}: ${resource.error}${resource.data ? ' Showing the last successful observation; values may be stale.' : key === 'jobs' ? ' Submit Search to retry.' : ' Use Refresh to retry.'}`));
-  }
-  if (resources.state.data && !resources.state.data.ready) notices.push(node('div', 'notice', 'The serving policy is not ready. No placement or policy generation is available yet.'));
-  if (view === 'jobs' && paginationNotice) notices.push(node('div', 'notice info', paginationNotice));
-  $('notices').replaceChildren(...notices);
+  const container = $('notices');
+  if (container.children.length === notices.length && notices.every((notice, index) => notice.textContent === container.children[index].textContent && notice.className === container.children[index].className)) return;
+  container.replaceChildren(...notices);
 }
 function renderOverview() {
   const data = resources.state.data;
@@ -600,7 +607,7 @@ function renderDiagnosticSource(source, title) {
   if (source.budgetNote) coverage.append(node('div', 'table-note', source.budgetNote));
   coverage.append(node('div', 'table-note', diagnosticSourceCaveat()));
   section.append(coverage);
-  const reasons = (source.truncationReasons || []).map((reason) => ({ 'byte-limit': 'Byte limit reached', 'pod-limit': 'Pod limit reached', 'group-limit': 'Issue-group limit reached', 'read-incomplete': 'Log read incomplete', 'previous-logs-unavailable': 'Previous-container logs unavailable' }[reason] || reason));
+  const reasons = (source.truncationReasons || []).map((reason) => ({ 'byte-limit': 'Byte limit reached. Logs are read from the start of each selected stream, so newer events may be missing.', 'pod-limit': 'Pod limit reached', 'group-limit': 'Issue-group limit reached', 'read-incomplete': 'Log read incomplete', 'previous-logs-unavailable': 'Previous-container logs unavailable' }[reason] || reason));
   if (source.truncated || source.groupsLimited || reasons.length) section.append(node('div', 'diagnostic-source-error', reasons.length ? reasons.join(' · ') : 'The collection was limited; some events may be missing.'));
   const issues = source.issues || [];
   const collapsed = issues.filter(isGeneratedFallback);

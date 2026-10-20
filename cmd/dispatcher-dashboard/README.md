@@ -114,6 +114,11 @@ components (4 MiB each by default). The accepted range is 1 MiB through 64 MiB.
 Collection has an 8-second deadline and no line-count cap. Budgets apply before
 filtering normal messages, so a busy controller can exhaust them while producing
 few matching issues. Selecting all available logs does not increase the budget.
+Kubernetes reads forward from the beginning of each requested log range. When the
+byte limit is reached, the sample contains the earliest eligible logs and newer
+events may be missing. In available mode, collection starts with the oldest logs
+that Kubernetes still retains for that container instance, rather than its newest
+events. The UI reports this limitation prominently when the byte limit is hit.
 
 The view reports bytes read, byte limits, observed first and last timestamps,
 and known truncation reasons. These timestamps do not prove uninterrupted

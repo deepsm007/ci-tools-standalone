@@ -4,4 +4,4 @@ COPY dispatcher-dashboard /usr/bin/dispatcher-dashboard
 USER 1001
 EXPOSE 8080
 ENTRYPOINT ["/usr/bin/dispatcher-dashboard"]
-CMD ["--listen=:8080"]
+CMD ["--listen=127.0.0.1:8080"]

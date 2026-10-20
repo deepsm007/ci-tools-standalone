@@ -69,6 +69,8 @@ func TestObservationRoutes(t *testing.T) {
 	}{
 		{"state", "GET", "/api/v1/dispatcher/state?token=browser-secret", 200, `{"ready":true}`, 200, "/observe/v1/state", ""},
 		{"jobs allowed filters", "GET", "/api/v1/dispatcher/jobs?name=foo&group=a%2Fb&cluster=build01&limit=2&after=bar&generation=8&url=http://evil&token=browser-secret", 200, `{"jobs":[]}`, 200, "/observe/v1/jobs", "after=bar&cluster=build01&generation=8&group=a%2Fb&limit=2&name=foo"},
+		{"URL-like filters", "GET", "/api/v1/dispatcher/jobs?name=https%3A%2F%2Fuser%3Asecret%40evil.example%2Fobserve%3Ftoken%3Dx%23fragment&group=%2F%2Fevil.example%2Fjobs&after=%3Furl%3Dhttp%3A%2F%2F169.254.169.254%2F", 200, `{"jobs":[]}`, 200, "/observe/v1/jobs", "after=%3Furl%3Dhttp%3A%2F%2F169.254.169.254%2F&group=%2F%2Fevil.example%2Fjobs&name=https%3A%2F%2Fuser%3Asecret%40evil.example%2Fobserve%3Ftoken%3Dx%23fragment"},
+		{"absolute request URL", "GET", "http://evil.example/api/v1/dispatcher/jobs?name=foo", 200, `{"jobs":[]}`, 200, "/observe/v1/jobs", "name=foo"},
 		{"overrides", "GET", "/api/v1/dispatcher/overrides?limit=2", 503, `{"error":"unavailable"}`, 503, "/observe/v1/overrides", ""},
 		{"bad filter", "GET", "/api/v1/dispatcher/jobs?limit=0", 400, `{"error":"limit must be between 1 and 500"}`, 400, "/observe/v1/jobs", "limit=0"},
 		{"generation changed", "GET", "/api/v1/dispatcher/jobs?generation=1", 409, `{"error":"serving policy generation changed; restart pagination"}`, 409, "/observe/v1/jobs", "generation=1"},
@@ -77,6 +79,9 @@ func TestObservationRoutes(t *testing.T) {
 		{"control route", "GET", "/api/v1/dispatcher/controls", 200, `{}`, 404, "", ""},
 		{"arbitrary path", "GET", "/observe/v1/state", 200, `{}`, 404, "", ""},
 		{"path extension", "GET", "/api/v1/dispatcher/state/anything", 200, `{}`, 404, "", ""},
+		{"authority-like path", "GET", "/api/v1/dispatcher//evil.example/jobs", 200, `{}`, 404, "", ""},
+		{"encoded path extension", "GET", "/api/v1/dispatcher/jobs%2F%2Fevil.example", 200, `{}`, 404, "", ""},
+		{"path traversal", "GET", "/api/v1/dispatcher/jobs/../state", 200, `{}`, 404, "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stub := &upstreamStub{status: tc.upstreamStatus, body: tc.body}
@@ -98,8 +103,11 @@ func TestObservationRoutes(t *testing.T) {
 				t.Fatalf("requests = %d, want 1", len(stub.requests))
 			}
 			got := stub.requests[0]
-			if diff := cmp.Diff([]string{tc.wantPath, tc.wantQuery, "Bearer test-observation-secret", "GET"}, []string{got.URL.Path, got.URL.RawQuery, got.Header.Get("Authorization"), got.Method}); diff != "" {
+			if diff := cmp.Diff([]string{"https", "dispatcher.example", tc.wantPath, tc.wantQuery, "Bearer test-observation-secret", "GET"}, []string{got.URL.Scheme, got.URL.Host, got.URL.Path, got.URL.RawQuery, got.Header.Get("Authorization"), got.Method}); diff != "" {
 				t.Errorf("unexpected request (-want +got):\n%s", diff)
+			}
+			if got.URL.User != nil {
+				t.Error("upstream URL contains credentials")
 			}
 			if response.Body.String() != tc.body {
 				t.Errorf("body = %q, want %q", response.Body.String(), tc.body)
