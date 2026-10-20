@@ -9,7 +9,11 @@ agentic mode. Chai owns second-stage execution unless a response timeout or
 ## Workflow
 
 - After applicable first-stage tests pass, create `ci/pipeline-gate`
-  pending (`queued`). Successful readiness dispatch starts a 20-minute wait for Chai.
+  pending (`queued`). In LGTM mode, also require the current `lgtm` label or
+  `pipeline-auto` override before creating readiness or starting its response timeout.
+  Either condition may arrive first. Removing approval preserves an existing gate
+  and its timer; each new HEAD/base requires current approval again.
+  Successful readiness dispatch starts a 20-minute wait for Chai.
 - Any new comment from a configured Chai author during the wait cancels the response timeout,
   but leaves the gate pending. No message within 20 minutes hands second-stage
   dispatch to the traditional workflow; the gate turns green only after dispatch succeeds.
@@ -33,7 +37,8 @@ agentic mode. Chai owns second-stage execution unless a response timeout or
   auto/manual/LGTM workflow. `/pipeline agentic-mode` restores agentic review
   only when repository/branch configuration permits it. Completed dispatch for
   the current revision is preserved; agentic readiness resumes on the next
-  HEAD/base. An incomplete dispatch gets fresh readiness once first-stage tests pass.
+  HEAD/base. An incomplete dispatch gets fresh readiness once first-stage tests pass
+  and the LGTM trigger, if configured, is satisfied.
   Traditional rerun commands retain current-revision ownership across this deferred
   restore and restart; the successful native check records that ownership.
   Reopening that check retains historical ownership in its rerun title, even if the

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
@@ -217,10 +218,317 @@ func (f *agenticFixture) reconcile(t *testing.T, comment *github.IssueComment) {
 
 func (f *agenticFixture) state() *agenticState { return f.a.states[f.work] }
 
+// TestAgenticLGTMReadinessWaitsForApprovalAndFirstStage covers both arrival orders of the readiness prerequisites.
+func TestAgenticLGTMReadinessWaitsForApprovalAndFirstStage(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		approvalFirst bool
+	}{
+		{name: "first-stage-success-before-approval"},
+		{name: "approval-before-first-stage-success", approvalFirst: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAgenticFixture(t, "lgtm")
+			if tc.approvalFirst {
+				f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
+			}
+			if !tc.approvalFirst {
+				f.passFirstStage()
+			}
+			f.reconcile(t, nil)
+			f.now = f.now.Add(2 * f.a.options.timeout)
+			f.reconcile(t, nil)
+			if diff := cmp.Diff(map[string]any{
+				"checks":               0,
+				"comments":             0,
+				"status writes":        0,
+				"ready":                false,
+				"timed out":            false,
+				"no response deadline": true,
+			}, map[string]any{
+				"checks":               len(f.gh.checks),
+				"comments":             len(f.gh.comments),
+				"status writes":        f.gh.statusWrites,
+				"ready":                f.state().ready,
+				"timed out":            f.state().timedOut,
+				"no response deadline": f.state().waitingUntil.IsZero(),
+			}); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+			if tc.approvalFirst {
+				f.passFirstStage()
+			}
+			if !tc.approvalFirst {
+				f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
+			}
+			f.reconcile(t, nil)
+			if diff := cmp.Diff(1, len(f.gh.checks)); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+			if diff := cmp.Diff(map[string]any{
+				"gate title":        agenticCheckTitle,
+				"gate status":       "queued",
+				"response deadline": f.now.Add(f.a.options.timeout),
+			}, map[string]any{
+				"gate title":        f.gh.checks[0].Output.Title,
+				"gate status":       f.gh.checks[0].Status,
+				"response deadline": f.state().waitingUntil,
+			}); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+			f.reconcile(t, nil)
+			if diff := cmp.Diff(1, len(f.gh.checks)); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+		})
+	}
+}
+
+// TestAgenticLGTMLabelEventUsesCurrentApproval ensures queued events use live approval metadata.
+func TestAgenticLGTMLabelEventUsesCurrentApproval(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		currentLGTM, eventLGTM bool
+		wantChecks             int
+	}{
+		{name: "current-approval-wakes-readiness", currentLGTM: true, wantChecks: 1},
+		{name: "absent-approval-waits"},
+		{name: "delayed-label-event-cannot-replace-current-approval", eventLGTM: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAgenticFixture(t, "lgtm")
+			f.passFirstStage()
+			f.a.queue = workqueue.NewTypedRateLimitingQueue(workqueue.NewTypedItemExponentialFailureRateLimiter[agenticWork](time.Second, time.Minute))
+			defer f.a.queue.ShutDown()
+			event := github.PullRequestEvent{Action: github.PullRequestActionLabeled, Label: github.Label{Name: labels.LGTM},
+				Repo: f.gh.pr.Base.Repo, PullRequest: f.gh.pr}
+			if tc.eventLGTM {
+				event.PullRequest.Labels = []github.Label{{Name: labels.LGTM}}
+			}
+			if tc.currentLGTM {
+				f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
+			}
+			f.a.handlePullRequest(f.a.logger, event)
+			if diff := cmp.Diff(1, len(f.a.inputs)); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+			if diff := cmp.Diff(true, f.a.processNext(context.Background())); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+			if diff := cmp.Diff(tc.wantChecks, len(f.gh.checks)); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+			if diff := cmp.Diff(tc.wantChecks == 0, f.state().waitingUntil.IsZero()); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+		})
+	}
+}
+
+// TestAgenticLGTMAutoOverridePublishesReadiness covers command and persisted-label overrides before LGTM.
+func TestAgenticLGTMAutoOverridePublishesReadiness(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		command bool
+	}{
+		{name: "explicit-command", command: true},
+		{name: "persisted-label"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAgenticFixture(t, "lgtm")
+			f.passFirstStage()
+			f.reconcile(t, nil)
+			if diff := cmp.Diff(0, len(f.gh.checks)); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+			var command *github.IssueComment
+			if tc.command {
+				command = f.command(100, "auto")
+			}
+			if !tc.command {
+				f.gh.pr.Labels = []github.Label{{Name: PipelineAutoLabel}}
+			}
+			f.reconcile(t, command)
+			if diff := cmp.Diff(1, len(f.gh.checks)); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+			if diff := cmp.Diff(map[string]any{
+				"auto override":        true,
+				"LGTM approval":        false,
+				"gate title":           agenticCheckTitle,
+				"no response deadline": false,
+				"comments":             0,
+			}, map[string]any{
+				"auto override":        hasAgenticLabel(&f.gh.pr, PipelineAutoLabel),
+				"LGTM approval":        hasAgenticLabel(&f.gh.pr, labels.LGTM),
+				"gate title":           f.gh.checks[0].Output.Title,
+				"no response deadline": f.state().waitingUntil.IsZero(),
+				"comments":             len(f.gh.comments),
+			}); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+		})
+	}
+}
+
+// TestAgenticLGTMOptOutWaitsForApproval keeps opted-out pipelines from creating gates before LGTM.
+func TestAgenticLGTMOptOutWaitsForApproval(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		command bool
+	}{
+		{name: "explicit-command", command: true},
+		{name: "persisted-label"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAgenticFixture(t, "lgtm")
+			f.passFirstStage()
+			var command *github.IssueComment
+			if tc.command {
+				command = f.command(100, "skip-agentic-mode")
+			}
+			if !tc.command {
+				f.gh.pr.Labels = []github.Label{{Name: agenticSkipLabel}}
+			}
+			f.reconcile(t, command)
+			f.now = f.now.Add(2 * f.a.options.timeout)
+			f.reconcile(t, nil)
+			if diff := cmp.Diff(map[string]any{
+				"opt out":              true,
+				"checks":               0,
+				"status writes":        0,
+				"no response deadline": true,
+			}, map[string]any{
+				"opt out":              f.state().optOut,
+				"checks":               len(f.gh.checks),
+				"status writes":        f.gh.statusWrites,
+				"no response deadline": f.state().waitingUntil.IsZero(),
+			}); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+			f.gh.pr.Labels = append(f.gh.pr.Labels, github.Label{Name: labels.LGTM})
+			f.reconcile(t, nil)
+			if diff := cmp.Diff(1, len(f.gh.checks)); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+			if diff := cmp.Diff(map[string]any{
+				"gate conclusion": "success",
+				"gate title":      traditionalCheckTitle,
+			}, map[string]any{
+				"gate conclusion": f.gh.checks[0].Conclusion,
+				"gate title":      f.gh.checks[0].Output.Title,
+			}); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+		})
+	}
+}
+
+// TestAgenticLGTMRemovalPreservesGateButNewRevisionWaits preserves current ownership while requiring fresh approval after a revision change.
+func TestAgenticLGTMRemovalPreservesGateButNewRevisionWaits(t *testing.T) {
+	for _, tc := range []struct {
+		name, newHead, newBase string
+	}{
+		{name: "new-head-requires-current-approval", newHead: strings.Repeat("b", 40)},
+		{name: "new-base-requires-current-approval", newBase: "release"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAgenticFixture(t, "lgtm")
+			f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
+			f.passFirstStage()
+			f.reconcile(t, nil)
+			gate, deadline := f.gh.checks[0], f.state().waitingUntil
+			f.gh.pr.Labels = nil
+			f.reconcile(t, nil)
+			if diff := cmp.Diff(map[string]any{
+				"gate":              gate,
+				"response deadline": deadline,
+			}, map[string]any{
+				"gate":              f.gh.checks[0],
+				"response deadline": f.state().waitingUntil,
+			}); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+			mark := f.command(100, "mark-pipeline-gate "+f.gh.pr.Head.SHA)
+			mark.User.Login = "chai[bot]"
+			f.reconcile(t, mark)
+			if diff := cmp.Diff("success", f.gh.checks[0].Conclusion); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+			f.a.states = nil
+			f.reconcile(t, nil)
+			if diff := cmp.Diff(true, f.state().dispatched); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+			if tc.newBase != "" {
+				f.gh.pr.Base.Ref = tc.newBase
+				f.a.lgtmWatcher.config.Orgs[0].Repos[0].Branches = append(f.a.lgtmWatcher.config.Orgs[0].Repos[0].Branches, tc.newBase)
+				presubmits := f.cfg.GetPresubmitsStatic("org/repo")
+				for i := range presubmits {
+					presubmits[i].Name = strings.Replace(presubmits[i].Name, "-main-", "-"+tc.newBase+"-", 1)
+				}
+				require.NoError(t, f.cfg.SetPresubmits(map[string][]config.Presubmit{"org/repo": presubmits}))
+				f.a.configDataProvider.gatherData()
+			}
+			if tc.newHead != "" {
+				f.gh.pr.Head.SHA = tc.newHead
+			}
+			f.passFirstStage()
+			f.reconcile(t, nil)
+			if diff := cmp.Diff(map[string]any{
+				"checks":               1,
+				"ready":                false,
+				"no response deadline": true,
+			}, map[string]any{
+				"checks":               len(f.gh.checks),
+				"ready":                f.state().ready,
+				"no response deadline": f.state().waitingUntil.IsZero(),
+			}); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+			f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
+			f.reconcile(t, nil)
+			if diff := cmp.Diff(2, len(f.gh.checks)); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+			if diff := cmp.Diff(map[string]any{
+				"new gate head": f.gh.pr.Head.SHA,
+			}, map[string]any{
+				"new gate head": f.gh.checks[1].HeadSHA,
+			}); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+		})
+	}
+}
+
 func TestAgenticReadinessAndCompletion(t *testing.T) {
 	for _, mode := range []string{"auto", "manual", "lgtm"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newAgenticFixture(t, mode)
+			if mode == "lgtm" {
+				f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
+			}
 			f.reconcile(t, nil)
 			require.Empty(t, f.gh.checks, "first-stage success must precede CheckRun creation")
 			f.passFirstStage()
@@ -305,12 +613,15 @@ func TestAgenticResponseTimeoutUsesTraditionalTrigger(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			trigger := strings.TrimSuffix(mode, "-approved")
 			f := newAgenticFixture(t, trigger)
-			if mode == "lgtm-approved" {
+			if trigger == "lgtm" {
 				f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
 			}
 			f.passFirstStage()
 			f.reconcile(t, nil)
 			f.now = f.state().waitingUntil
+			if mode == "lgtm" {
+				f.gh.pr.Labels = nil // Fallback must wait if approval was removed after handoff.
+			}
 			f.gh.beforeComment = func(body string) {
 				if strings.Contains(body, "/test e2e") {
 					require.NotEqual(t, "success", f.gh.checks[0].Conclusion)
@@ -374,6 +685,9 @@ func TestAgenticReenableCompletedDispatchPreservesRevision(t *testing.T) {
 			for _, restore := range []string{"command", "label-removal"} {
 				t.Run(fmt.Sprintf("%s/restart=%t/%s", mode, restart, restore), func(t *testing.T) {
 					f := newAgenticFixture(t, mode)
+					if mode == "lgtm" {
+						f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
+					}
 					f.passFirstStage()
 					f.reconcile(t, nil)
 					f.reconcile(t, f.command(100, "skip-agentic-mode"))
@@ -407,6 +721,9 @@ func TestAgenticReenableCompletedDispatchPreservesRevision(t *testing.T) {
 					f.reconcile(t, nil)
 					require.Equal(t, []github.CheckRun{completed}, f.gh.checks, "restart must preserve the completed revision")
 					require.Len(t, f.gh.comments, comments, "no redispatch or response timeout for this HEAD")
+					if mode == "lgtm" {
+						f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
+					}
 					f.gh.pr.Head.SHA = strings.Repeat("b", 40)
 					f.a.reader = newFakePJLister()
 					f.reconcile(t, nil)
@@ -444,6 +761,9 @@ func TestAgenticDeferredRestoreRetainsTraditionalCommands(t *testing.T) {
 			for _, restart := range []bool{false, true} {
 				t.Run(fmt.Sprintf("%s/%s/restart=%t", mode, origin, restart), func(t *testing.T) {
 					f := newAgenticFixture(t, mode)
+					if mode == "lgtm" {
+						f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
+					}
 					f.passFirstStage()
 					if origin == "skip" {
 						f.reconcile(t, f.command(100, "skip-agentic-mode"))

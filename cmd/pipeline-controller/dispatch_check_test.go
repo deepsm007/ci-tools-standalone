@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/types"
@@ -15,6 +16,68 @@ import (
 	"sigs.k8s.io/prow/pkg/github"
 	"sigs.k8s.io/prow/pkg/labels"
 )
+
+// TestTraditionalOpeningGateRespectsLGTMTrigger preserves job contexts while waiting for LGTM approval.
+func TestTraditionalOpeningGateRespectsLGTMTrigger(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode, label, mainTrigger string
+		wantGate                       bool
+	}{
+		{name: "unapproved", mode: "lgtm"},
+		{name: "approved", mode: "lgtm", label: labels.LGTM, wantGate: true},
+		{name: "auto-override", mode: "lgtm", label: PipelineAutoLabel, wantGate: true},
+		{name: "automatic", mode: "auto", wantGate: true},
+		{name: "manual", mode: "manual", wantGate: true},
+		{name: "main-auto-precedence", mode: "lgtm", mainTrigger: "auto", wantGate: true},
+		{name: "main-manual-precedence", mode: "lgtm", mainTrigger: "manual", wantGate: true},
+		{name: "main-lgtm", mode: "auto", mainTrigger: "lgtm"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAgenticFixture(t, tc.mode)
+			if tc.label != "" {
+				f.gh.pr.Labels = []github.Label{{Name: tc.label}}
+			}
+			if tc.mainTrigger != "" {
+				if tc.mode == "lgtm" {
+					f.a.watcher = &watcher{config: f.a.lgtmWatcher.config}
+				}
+				f.a.watcher.config.Orgs[0].Repos[0].Mode.Trigger = tc.mainTrigger
+			}
+			cw := &clientWrapper{ghc: f.gh, configDataProvider: f.a.configDataProvider,
+				watcher: f.a.watcher, lgtmWatcher: f.a.lgtmWatcher, checks: f.a.checks}
+			for _, action := range []github.PullRequestEventAction{github.PullRequestActionOpened, github.PullRequestActionReopened, github.PullRequestActionSynchronize} {
+				cw.handlePipelineContextCreation(f.a.logger, github.PullRequestEvent{
+					Action: action, Repo: f.gh.pr.Base.Repo, PullRequest: f.gh.pr})
+			}
+			wantChecks := 0
+			if tc.wantGate {
+				wantChecks = 1
+			}
+			if diff := cmp.Diff(wantChecks, len(f.gh.checks)); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+			if tc.wantGate {
+				if diff := cmp.Diff("queued", f.gh.checks[0].Status); diff != "" {
+					t.Errorf("unexpected result (-want +got):\n%s", diff)
+					return
+				}
+			}
+			if diff := cmp.Diff(true, len(f.gh.statusUpdates) > 0); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+			if diff := cmp.Diff(github.Status{Context: "ci/e2e", State: "pending", Description: PipelinePendingMessage}, f.gh.statusUpdates[0]); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+			if diff := cmp.Diff(0, len(f.gh.comments)); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+				return
+			}
+		})
+	}
+}
 
 func TestTraditionalDispatchCheckModes(t *testing.T) {
 	for _, mode := range []string{"auto", "lgtm", "manual"} {
@@ -46,8 +109,13 @@ func TestTraditionalDispatchCheckModes(t *testing.T) {
 			event := github.PullRequestEvent{Action: github.PullRequestActionOpened, Repo: gh.pr.Base.Repo, PullRequest: gh.pr}
 			cw.handlePipelineContextCreation(logger, event)
 			cw.handlePipelineContextCreation(logger, event)
-			require.Len(t, gh.checks, 1)
-			require.Equal(t, "queued", gh.checks[0].Status)
+			if mode == "lgtm" {
+				require.Empty(t, gh.checks, "LGTM mode must not create a gate before approval")
+			} else {
+				require.Len(t, gh.checks, 1)
+				require.Equal(t, "queued", gh.checks[0].Status)
+			}
+			require.NotEmpty(t, gh.statusUpdates, "individual job contexts must still be published")
 			gh.beforeComment = func(string) {
 				require.Equal(t, "in_progress", gh.checks[0].Status)
 				require.NotEqual(t, "success", gh.checks[0].Conclusion)
@@ -62,6 +130,7 @@ func TestTraditionalDispatchCheckModes(t *testing.T) {
 				require.NoError(t, r.reconcile(context.Background(), req))
 			case "lgtm":
 				event.Action, event.Label = github.PullRequestActionLabeled, github.Label{Name: labels.LGTM}
+				event.PullRequest.Labels = []github.Label{{Name: labels.LGTM}}
 				cw.handleLabelAddition(logger, event)
 				cw.handleLabelAddition(logger, event)
 			case "manual":

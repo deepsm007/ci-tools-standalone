@@ -12,7 +12,9 @@ the normal-selection behavior below applies.
 The same opening notification is used with either selection method.
 
 With GitHub App authentication, traditional pipelines create
-`ci/pipeline-gate` on PR open/push/reopen. It stays pending until the configured
+`ci/pipeline-gate` on PR open/push/reopen in automatic and manual modes. In LGTM
+mode, gate creation waits for `lgtm` or the `/pipeline auto` override; individual
+job contexts are still published before approval. It stays pending until the configured
 trigger dispatches the applicable jobs through a `/test` comment, then succeeds
 without waiting for test results or Chai. An empty/already-dispatched selection
 also succeeds; planning or dispatch errors never turn it green. Individual job
@@ -243,6 +245,9 @@ Requires GitHub App authentication, `--agentic-trusted-author=<chai-login>`
 (repeatable) and optional `--agentic-timeout=20m`. There is no storage requirement.
 
 1. Applicable first-stage tests pass in the shared ProwJob cache (including overrides).
+   In LGTM mode, the PR must also currently carry `lgtm` or the `pipeline-auto`
+   label set by `/pipeline auto`; either approval or first-stage success may arrive first.
+   Until both conditions hold, no readiness check or response timeout is created.
    Create `ci/pipeline-gate` **queued**; `check_run.created` signals Chai and starts its response timeout.
 2. Any new comment from a configured Chai author after readiness and within the timeout
    cancels it; no acknowledgement command or HEAD is needed. The gate stays pending.
@@ -268,12 +273,16 @@ After Chai responds there is no completion timeout: use `/pipeline skip-agentic-
   Chai completion cannot take ownership back on the completed traditional revision.
   An initial failed dispatch without earlier completion can still restore immediately.
   Otherwise, a fresh readiness signal
-  is created after first-stage success. Already-agentic PRs are unchanged.
+  is created after first-stage success and, in LGTM mode, current `lgtm` or
+  `pipeline-auto` approval. Already-agentic PRs are unchanged.
 - Manual opt-out label removal also preserves completed dispatch. Repeat commands preserve it.
   A completed agentic gate keeps its agentic owner unless an actual traditional
   dispatch or acknowledgment while opted out writes traditional ownership.
 - `/pipeline required` and `/pipeline remaining` are rejected, not queued, while agentic.
-  `/pipeline auto` only sets the existing LGTM auto label. Running tests are never cancelled.
+  `/pipeline auto` sets the existing LGTM auto label and permits readiness after
+  first-stage success without `lgtm`. Removing `lgtm` after readiness preserves the
+  existing gate and response timeout; a new HEAD/base requires current approval again.
+  Running tests are never cancelled.
 - Mode commands and help accept LF or CRLF line endings; edited comments do not
   execute mode changes. Confirmation replies are best-effort: a delivery failure
   is logged and never replays a successful label mutation. Actual mutation failures

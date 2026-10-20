@@ -89,7 +89,7 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 			} else if deferred {
 				reply("Agentic mode is enabled for the next HEAD SHA. Traditional scheduling still owns this HEAD; its rerun gate is unchanged. Use `/pipeline required` or `/pipeline remaining` to recover the traditional rerun.")
 			} else {
-				reply("Agentic mode is restored. First-stage success will create a fresh pending pipeline gate. Running tests are unchanged.")
+				reply("Agentic mode is restored. First-stage success will create a fresh pending pipeline gate once the configured trigger is satisfied (LGTM or `/pipeline auto` in LGTM mode). Running tests are unchanged.")
 			}
 		}
 	case "mark-pipeline-gate":
