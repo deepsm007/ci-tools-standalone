@@ -10,6 +10,7 @@ Standalone CI tools extracted from [openshift/ci-tools](https://github.com/opens
 | `cluster-manifest-verifier` | Validates openshift/release cluster manifest PRs against Argo CD (generate + dry-run sync) |
 | `ci-scheduling-webhook` | Kubernetes mutating admission webhook for CI workload scheduling and prioritization |
 | `determinize-peribolos` | Deterministically formats Peribolos org configuration YAML |
+| [`dispatcher-dashboard`](cmd/dispatcher-dashboard/README.md) | Read-only web dashboard for dispatcher policy, placement, overrides, and optional Kubernetes pod-log diagnostics |
 | `gpu-scheduling-webhook` | Kubernetes mutating admission webhook for GPU/KVM workload scheduling |
 | `helpdesk-faq` | Web service that serves helpdesk FAQ items from Kubernetes ConfigMaps |
 | `pipeline-controller` | Kubernetes controller that manages CI pipeline resources |

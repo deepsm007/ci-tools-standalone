@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Dispatcher · CI Platform</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <aside class="sidebar" aria-label="Main navigation">
+    <a class="brand" href="?view=overview"><span>CI Platform<small>DISPATCHER</small></span></a>
+    <div class="nav-caption">OBSERVABILITY</div>
+    <nav>
+      <a href="?view=overview" data-view="overview"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>Overview</a>
+      <a href="?view=clusters" data-view="clusters"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="6" rx="1"/><rect x="3" y="15" width="18" height="6" rx="1"/><path d="M7 6h1M7 18h1M12 9v6"/></svg>Cluster policy</a>
+      <a href="?view=jobs" data-view="jobs"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="18" height="15" rx="2"/><path d="M8 6V3h8v3M3 12h18M10 12v3h4v-3"/></svg>Job lookup</a>
+      <a href="?view=overrides" data-view="overrides"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="15" cy="17" r="3"/></svg>Overrides</a>
+      <a href="?view=diagnostics" data-view="diagnostics"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>Diagnostics</a>
+    </nav>
+    <div class="sidebar-footer"><span class="readonly-dot"></span> Read-only access<p>Observe effective placement<br>and temporary policy changes.</p></div>
+  </aside>
+  <div class="workspace">
+    <header class="topbar"><div class="breadcrumb">CI Platform <span>/</span> Dispatcher <span>/</span> <strong id="breadcrumb-view">Overview</strong></div><div class="topbar-tags"><span id="demo-badge" class="badge amber" hidden>DEMO DATA</span><span class="badge outline"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="2"/><path d="M5 7V5a3 3 0 0 1 6 0v2"/></svg>Read only</span></div></header>
+    <main id="main" tabindex="-1">
+      <div class="page-heading"><div><div class="eyebrow">DISPATCHER OBSERVATION</div><h1 id="page-title">Overview</h1><p id="page-description">The policy being served and where jobs are placed.</p></div><div class="refresh-controls"><label class="auto-refresh"><input id="auto-refresh" type="checkbox" checked><span>Auto-refresh <span id="refresh-interval">15s</span></span></label><button id="refresh" class="button" type="button"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M16 7a6 6 0 1 0 .1 6M16 3v4h-4"/></svg><span>Refresh</span></button></div></div>
+      <div id="freshness" class="freshness" aria-live="polite">Connecting to the dispatcher…</div>
+      <div id="notices" aria-live="polite"></div>
+      <div id="content" aria-busy="true"><div class="empty-state"><span class="loading-dot"></span><h2>Loading dispatcher observations</h2><p>Fetching the current serving policy.</p></div></div>
+      <footer class="page-footer"><span id="source-kind">Dispatcher observation API</span><span id="source-note">Placement estimates, not physical cluster utilization.</span></footer>
+    </main>
+  </div>
+  <dialog id="details" aria-labelledby="detail-title"><div class="drawer-heading"><div><div id="detail-kind" class="eyebrow">DETAILS</div><h2 id="detail-title"></h2></div><button id="close-details" class="icon-button" aria-label="Close details">×</button></div><div id="detail-content"></div><div class="drawer-footer"><span>Read-only observation</span><button id="done-details" class="button">Close details</button></div></dialog>
+</body>
+</html>
