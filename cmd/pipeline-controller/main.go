@@ -39,6 +39,11 @@ const PipelinePendingMessage = "Waiting for pipeline condition to trigger this j
 // PipelineAutoLabel is the label that marks a PR to behave as automatic mode
 const PipelineAutoLabel = "pipeline-auto"
 
+// pipelineGateTriggerSatisfied keeps LGTM pipelines from signaling readiness before approval.
+func pipelineGateTriggerSatisfied(trigger string, pr *github.PullRequest) bool {
+	return trigger != "lgtm" || hasAgenticLabel(pr, labels.LGTM) || hasAgenticLabel(pr, PipelineAutoLabel)
+}
+
 type options struct {
 	client                   prowflagutil.KubernetesOptions
 	github                   prowflagutil.GitHubOptions
@@ -643,12 +648,15 @@ func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event gi
 	// Check if branch is enabled for this repo
 	baseBranch := event.PullRequest.Base.Ref
 	var branchEnabled bool
+	var trigger string
 	if orgExists && repoExists {
 		repoConfig := repos[repo]
 		branchEnabled = isBranchEnabled(repoConfig.Branches, baseBranch)
+		trigger = repoConfig.Trigger
 	} else if lgtmOrgExists && lgtmRepoExists {
 		lgtmRepoConfig := lgtmRepos[repo]
 		branchEnabled = isBranchEnabled(lgtmRepoConfig.Branches, baseBranch)
+		trigger = "lgtm"
 	}
 
 	if !branchEnabled {
@@ -662,7 +670,7 @@ func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event gi
 		"pr":   number,
 		"sha":  sha,
 	})
-	if sha != "" {
+	if sha != "" && pipelineGateTriggerSatisfied(trigger, &event.PullRequest) {
 		refs := &v1.Refs{Org: org, Repo: repo, BaseRef: baseBranch, Pulls: []v1.Pull{{Number: number, SHA: sha}}}
 		if err := cw.checks.pending(refs); err != nil {
 			logger.WithError(err).Error("failed to create pipeline dispatch check")

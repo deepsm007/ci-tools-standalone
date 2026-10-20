@@ -222,6 +222,11 @@ func (a *agenticController) reconcilePull(ctx context.Context, work agenticWork,
 		return a.dispatchTraditional(ctx, work, s, pr, cfg)
 	}
 	if !s.ready {
+		// LGTM controls new Chai handoffs; an existing gate keeps its ownership
+		// and response deadline even if approval is later removed.
+		if !pipelineGateTriggerSatisfied(cfg.Trigger, pr) {
+			return nil
+		}
 		pj := &v1.ProwJob{Spec: v1.ProwJobSpec{Refs: pullRefs(work.org, work.repo, pr)}}
 		complete, err := checkFirstStageComplete(ctx, a.reader, pj, a.configDataProvider.GetPresubmits(work.org+"/"+work.repo))
 		if err != nil || !complete {
@@ -336,6 +341,9 @@ func (a *agenticController) publishReadiness(work agenticWork, s *agenticState, 
 // This is the ordinary selector and /test dispatcher, not an agentic scheduler.
 func (a *agenticController) dispatchTraditional(ctx context.Context, work agenticWork, s *agenticState, pr *github.PullRequest, cfg RepoConfig) error {
 	if s.dispatched {
+		return nil
+	}
+	if !pipelineGateTriggerSatisfied(cfg.Trigger, pr) {
 		return nil
 	}
 	if err := a.checks.pending(pullRefs(work.org, work.repo, pr)); err != nil {
