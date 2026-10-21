@@ -41,9 +41,15 @@ type options struct {
 }
 
 const (
-	alertmanagerServiceHost               = "alertmanager-user-workload.openshift-user-workload-monitoring.svc"
-	alertmanagerServiceFullyQualifiedHost = "alertmanager-user-workload.openshift-user-workload-monitoring.svc.cluster.local"
-	alertmanagerServicePort               = "9095"
+	// User workload monitoring Alertmanager (app.ci, legacy).
+	uwmServiceHost = "alertmanager-user-workload.openshift-user-workload-monitoring.svc"
+	uwmServiceFQDN = "alertmanager-user-workload.openshift-user-workload-monitoring.svc.cluster.local"
+	uwmServicePort = "9095"
+
+	// Custom Prometheus Operator Alertmanager (core-ci ci-monitoring).
+	ciMonitoringServiceHost = "alertmanager-operated.ci-monitoring.svc"
+	ciMonitoringServiceFQDN = "alertmanager-operated.ci-monitoring.svc.cluster.local"
+	ciMonitoringServicePort = "9093"
 )
 
 func gatherOptions(args []string) (options, error) {
@@ -73,6 +79,19 @@ func gatherOptions(args []string) (options, error) {
 	return o, fs.Parse(args)
 }
 
+// allowedAlertmanagerEndpoint returns true if host:port names a known
+// in-cluster Alertmanager endpoint. The allowlist prevents SSRF by
+// restricting the proxy to the exact services it may contact.
+func allowedAlertmanagerEndpoint(host, port string) bool {
+	switch {
+	case (host == uwmServiceHost || host == uwmServiceFQDN) && port == uwmServicePort:
+		return true
+	case (host == ciMonitoringServiceHost || host == ciMonitoringServiceFQDN) && port == ciMonitoringServicePort:
+		return true
+	}
+	return false
+}
+
 func validateAlertmanagerURL(value string) error {
 	parsed, err := url.ParseRequestURI(value)
 	if err != nil || !parsed.IsAbs() || parsed.Host == "" {
@@ -85,11 +104,8 @@ func validateAlertmanagerURL(value string) error {
 		return errors.New("scheme must be HTTPS")
 	}
 	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
-	if host != alertmanagerServiceHost && host != alertmanagerServiceFullyQualifiedHost {
-		return errors.New("must target the in-cluster Alertmanager service")
-	}
-	if parsed.Port() != alertmanagerServicePort {
-		return fmt.Errorf("must target Alertmanager service port %s", alertmanagerServicePort)
+	if !allowedAlertmanagerEndpoint(host, parsed.Port()) {
+		return errors.New("must target a known in-cluster Alertmanager service")
 	}
 	if parsed.EscapedPath() != "" && parsed.EscapedPath() != "/" {
 		return errors.New("must not contain an API path")
