@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/go-cmp/cmp"
 )
 
 func TestRendererCapsMembersAndMaintainsOverflowThread(t *testing.T) {
@@ -122,6 +124,45 @@ func TestRenderedAlertKeepsAnnotationLinks(t *testing.T) {
 		" · <https://prometheus.example/graph?g0.expr=up%3C!channel|source>"
 	if got != want {
 		t.Fatalf("got  %q\nwant %q", got, want)
+	}
+}
+
+func TestRenderedAlertSourceLinks(t *testing.T) {
+	detail := "See <https://grafana.example/d/dashboard?orgId=1&viewPanel=4|Grafana Dashboard> | " +
+		"<https://prow.ci.openshift.org/?job=periodic-prow-auto-config-brancher|Deck> | " +
+		"<https://github.com/openshift/release/blob/main/docs/dptp-triage-sop/infrastructure-jobs.md#periodic-prow-auto-config-brancher|SOP>."
+	for _, tc := range []struct {
+		name         string
+		generatorURL string
+		sourceLink   string
+	}{
+		{name: "HTTPS", generatorURL: "https://query.example/graph?g0.expr=up&g0.tab=1", sourceLink: " · <https://query.example/graph?g0.expr=up&g0.tab=1|source>"},
+		{name: "HTTP", generatorURL: "http://query.example/graph?g0.expr=up", sourceLink: " · <http://query.example/graph?g0.expr=up|source>"},
+		{name: "link delimiters", generatorURL: "https://query.example/graph?g0.expr=up<!channel>|other", sourceLink: " · <https://query.example/graph?g0.expr=up%3C!channel%3E%7Cother|source>"},
+		{name: "empty"},
+		{name: "relative graph", generatorURL: "/graph?g0.expr=up&g0.tab=1"},
+		{name: "relative path", generatorURL: "graph?g0.expr=up"},
+		{name: "scheme relative", generatorURL: "//query.example/graph?g0.expr=up"},
+		{name: "missing host", generatorURL: "https:///graph?g0.expr=up"},
+		{name: "malformed escape", generatorURL: "https://query.example/%zz"},
+		{name: "non HTTP scheme", generatorURL: "javascript:alert(1)"},
+		{name: "URL credentials", generatorURL: "https://user:password@query.example/graph"},
+		{name: "space", generatorURL: "https://query.example/graph?g0.expr=up == 0"},
+		{name: "control character", generatorURL: "https://query.example/graph\n<!channel>"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			alert := AlertSnapshot{
+				Fingerprint:  "a",
+				Status:       "firing",
+				Labels:       map[string]string{"alertname": "infrastructure-job-failures"},
+				Annotations:  map[string]string{"message": detail},
+				GeneratorURL: tc.generatorURL,
+			}
+			want := ":red_circle: *infrastructure-job-failures* — `firing`\n" + detail + tc.sourceLink
+			if diff := cmp.Diff(want, renderAlert(alert)); diff != "" {
+				t.Errorf("unexpected rendered alert (-want +got):\n%s", diff)
+			}
+		})
 	}
 }
 
