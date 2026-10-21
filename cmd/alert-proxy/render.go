@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -197,7 +198,7 @@ func renderAlert(a AlertSnapshot) string {
 	if detail != "" {
 		line += "\n" + slackAnnotationText(detail)
 	}
-	if a.GeneratorURL != "" {
+	if validSourceURL(a.GeneratorURL) {
 		line += fmt.Sprintf(" · <%s|source>", slackURL(a.GeneratorURL))
 	}
 	return line
@@ -333,6 +334,15 @@ func slackAnnotationText(s string) string {
 // "<" matters as much as ">": leaving it raw lets a URL smuggle a broadcast, as
 // in <https://x?<!channel|source>, which Slack reads as <!channel|source>.
 var slackURLEscaper = strings.NewReplacer("|", "%7C", "<", "%3C", ">", "%3E")
+
+// validSourceURL excludes relative generator URLs because Slack has no query-server base URL.
+func validSourceURL(value string) bool {
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Hostname() == "" || parsed.User != nil || strings.ContainsAny(value, " \t\r\n") {
+		return false
+	}
+	return parsed.Scheme == "http" || parsed.Scheme == "https"
+}
 
 func slackURL(s string) string {
 	return slackURLEscaper.Replace(s)
