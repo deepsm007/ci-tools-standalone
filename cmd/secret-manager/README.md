@@ -11,7 +11,8 @@ Access is controlled through Rover groups.
 ## Architecture
 
 **Containerized Deployment:**
-- Source code lives in `ci-tools/cmd/secret-manager/`
+
+- Source code lives in `ci-tools-standalone/cmd/secret-manager/`
 - Built and published to `quay.io/openshift/ci-public:ci_secret-manager_latest`
 - Users run via wrapper script in `openshift/release` repo: `hack/secret-manager.sh`
 
@@ -23,8 +24,11 @@ Users in the `openshift/release` repository run:
 # Authenticate (first time only)
 ./hack/secret-manager.sh login
 
-# List secrets
+# List collections (no SSO login needed)
 ./hack/secret-manager.sh list
+
+# List secrets in a collection
+./hack/secret-manager.sh list -c my-collection
 
 # Show a secret's metadata (creation date, ownership info; never the value)
 ./hack/secret-manager.sh describe -c my-collection aws/access-key-id
@@ -75,4 +79,3 @@ export SECRET_MANAGER_IMAGE=localhost/secret-manager:dev
 cd /path/to/openshift/release
 ./hack/secret-manager.sh login
 ```
-

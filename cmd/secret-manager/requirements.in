@@ -2,6 +2,7 @@ click>=8.0
 google-cloud-secret-manager>=2.20
 requests>=2.30
 pyyaml>=6.0
+cryptography>=47.0.0
 # Security: Ensure vulnerable transitive dependencies are upgraded
 pyasn1>=0.6.3  # CVE-2026-23490, CVE-2026-30922
 urllib3>=2.6.3  # CVE-2025-66471, CVE-2025-66418, GHSA-38jv-5279-wg99

@@ -4,13 +4,14 @@
 import json
 
 import click
-from google.cloud import secretmanager
+import proxy_auth
+import requests
 from util import (
-    ensure_authentication,
     get_group_collections,
-    get_secrets_from_index,
     validate_collection,
 )
+
+PROXY_URL = "https://gsm-proxy.ci.openshift.org"
 
 
 @click.command("list")
@@ -47,9 +48,7 @@ def list_secrets(output: str, collection: str, rover_group: str):
         )
 
     if collection != "":
-        client = secretmanager.SecretManagerServiceClient()
-        ensure_authentication(client, collection)
-        list_secrets_for_collection(client, collection, output)
+        list_secrets_for_collection(collection, output)
         return
 
     collections_dict = get_group_collections()
@@ -85,14 +84,39 @@ def list_collections_for_rover_group(
             click.echo(f"{collection}")
 
 
-def list_secrets_for_collection(
-    client: secretmanager.SecretManagerServiceClient, collection: str, output: str
-):
-    secret_list = get_secrets_from_index(client, collection
-    )
+def list_secrets_from_proxy(collection):
+    token = proxy_auth.get_token()
+    try:
+        response = requests.get(
+            f"{PROXY_URL}/api/v1/collections/{collection}/secrets",
+            headers={"Authorization": "Bearer " + token},
+            timeout=30,
+            allow_redirects=False,
+        )
+        if response.status_code == 401:
+            raise click.ClickException(
+                "Authentication was rejected. Run `sm login` to re-authenticate, then retry the command."
+            )
+        if response.status_code == 403:
+            raise click.ClickException(
+                f"You don't have permission to list collection '{collection}'."
+            )
+        if response.status_code != 200:
+            raise click.ClickException(
+                f"GSM proxy request failed (HTTP {response.status_code})."
+            )
+        paths = response.json()["secrets"]
+        if not isinstance(paths, list) or not all(
+            isinstance(path, str) for path in paths
+        ):
+            raise ValueError("Invalid paths")
+        return sorted(paths)
+    except (requests.RequestException, ValueError, KeyError) as error:
+        raise click.ClickException("Could not read the response.") from error
 
-    paths = [secret.replace("__", "/") for secret in secret_list]
-    paths.sort()
+
+def list_secrets_for_collection(collection: str, output: str):
+    paths = list_secrets_from_proxy(collection)
 
     if output == "json":
         click.echo(json.dumps(paths, indent=2))
