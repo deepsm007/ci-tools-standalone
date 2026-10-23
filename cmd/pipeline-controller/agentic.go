@@ -222,17 +222,21 @@ func (a *agenticController) reconcilePull(ctx context.Context, work agenticWork,
 		return a.dispatchTraditional(ctx, work, s, pr, cfg)
 	}
 	if !s.ready {
-		// LGTM controls new Chai handoffs; an existing gate keeps its ownership
-		// and response deadline even if approval is later removed.
-		if !pipelineGateTriggerSatisfied(cfg.Trigger, pr) {
+		automatic := cfg.Trigger != "manual"
+		if !automatic && s.publishedAt.IsZero() {
 			return nil
 		}
-		pj := &v1.ProwJob{Spec: v1.ProwJobSpec{Refs: pullRefs(work.org, work.repo, pr)}}
-		complete, err := checkFirstStageComplete(ctx, a.reader, pj, a.configDataProvider.GetPresubmits(work.org+"/"+work.repo))
-		if err != nil || !complete {
-			return err
+		if automatic {
+			if !pipelineGateTriggerSatisfied(cfg.Trigger, pr) {
+				return nil
+			}
+			pj := &v1.ProwJob{Spec: v1.ProwJobSpec{Refs: pullRefs(work.org, work.repo, pr)}}
+			complete, err := checkFirstStageComplete(ctx, a.reader, pj, a.configDataProvider.GetPresubmits(work.org+"/"+work.repo))
+			if err != nil || !complete {
+				return err
+			}
 		}
-		created, err := a.publishReadiness(work, s, pr)
+		created, err := a.publishReadiness(work, s, pr, automatic)
 		if err != nil {
 			return err
 		}
@@ -298,8 +302,9 @@ func (a *agenticController) retireCheck(work agenticWork, gate github.CheckRun) 
 		Output: github.CheckRunOutput{Title: agenticCheckTitle, Summary: "Previous dispatch completion was invalidated; a new pipeline cycle is required."}})
 }
 
+// publishReadiness recovers persisted handoff state and creates a gate only when allowCreate is true.
 // The boolean reports new creation, so an earlier comment cannot cancel its timer.
-func (a *agenticController) publishReadiness(work agenticWork, s *agenticState, pr *github.PullRequest) (bool, error) {
+func (a *agenticController) publishReadiness(work agenticWork, s *agenticState, pr *github.PullRequest, allowCreate bool) (bool, error) {
 	a.checks.mu.Lock()
 	defer a.checks.mu.Unlock()
 	gate, err := findPipelineCheck(a.gh, a.appID, work.org, work.repo, s.head)
@@ -322,6 +327,9 @@ func (a *agenticController) publishReadiness(work agenticWork, s *agenticState, 
 			s.waitingUntil = s.publishedAt.Add(a.options.timeout) // Preserve the original deadline after a lost creation response.
 		}
 		return false, nil // Restarts do not recover response timers.
+	}
+	if !allowCreate {
+		return false, nil // A lost response may be recovered without starting another manual handoff.
 	}
 	if gate.ID != 0 {
 		if err := a.retireCheck(work, *gate); err != nil {

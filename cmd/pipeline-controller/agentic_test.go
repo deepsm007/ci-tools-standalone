@@ -534,6 +534,9 @@ func TestAgenticReadinessAndCompletion(t *testing.T) {
 			f.passFirstStage()
 			f.reconcile(t, &github.IssueComment{ID: 90, Body: "Chai has not seen readiness yet.",
 				User: github.User{Login: "chai[bot]"}, CreatedAt: f.now})
+			if mode == "manual" {
+				f.reconcile(t, f.command(95, "required"))
+			}
 			require.Len(t, f.gh.checks, 1)
 			require.Equal(t, pipelineGate, f.gh.checks[0].Name)
 			require.Equal(t, "queued", f.gh.checks[0].Status)
@@ -567,7 +570,7 @@ func TestAgenticChaiCommentResponse(t *testing.T) {
 		t.Run(scenario, func(t *testing.T) {
 			f := newAgenticFixture(t, "manual")
 			f.passFirstStage()
-			f.reconcile(t, nil)
+			f.reconcile(t, f.command(1, "required"))
 			deadline, gate, writes := f.state().waitingUntil, f.gh.checks[0], f.gh.checkAttempts
 			f.now = f.now.Add(time.Minute)
 			comment := github.IssueComment{ID: 100, Body: "Looking at this PR.", User: github.User{Login: "chai[bot]"}, CreatedAt: f.now}
@@ -617,6 +620,9 @@ func TestAgenticResponseTimeoutUsesTraditionalTrigger(t *testing.T) {
 				f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
 			}
 			f.passFirstStage()
+			if trigger == "manual" {
+				f.reconcile(t, f.command(1, "required"))
+			}
 			f.reconcile(t, nil)
 			f.now = f.state().waitingUntil
 			if mode == "lgtm" {
@@ -656,7 +662,7 @@ func TestAgenticResponseTimeoutUsesTraditionalTrigger(t *testing.T) {
 func TestAgenticModeSwitchAndIdempotence(t *testing.T) {
 	f := newAgenticFixture(t, "manual")
 	f.passFirstStage()
-	f.reconcile(t, nil)
+	f.reconcile(t, f.command(1, "required"))
 	deadline := f.state().waitingUntil
 	f.reconcile(t, f.command(100, "agentic-mode"))
 	require.Len(t, f.gh.checks, 1)
@@ -729,6 +735,9 @@ func TestAgenticReenableCompletedDispatchPreservesRevision(t *testing.T) {
 					f.reconcile(t, nil)
 					require.Len(t, f.gh.checks, 1, "next SHA still waits for first-stage success")
 					f.passFirstStage()
+					if mode == "manual" {
+						f.reconcile(t, f.command(400, "required"))
+					}
 					f.reconcile(t, nil)
 					require.Len(t, f.gh.checks, 2)
 					require.Equal(t, completed, f.gh.checks[0])
@@ -768,6 +777,9 @@ func TestAgenticDeferredRestoreRetainsTraditionalCommands(t *testing.T) {
 					if origin == "skip" {
 						f.reconcile(t, f.command(100, "skip-agentic-mode"))
 					} else {
+						if mode == "manual" {
+							f.reconcile(t, f.command(1, "required"))
+						}
 						f.reconcile(t, nil)
 						f.now = f.state().waitingUntil
 						f.reconcile(t, nil)
@@ -822,7 +834,7 @@ func TestAgenticConfirmationFailureDoesNotReplayModeChange(t *testing.T) {
 		t.Run(fmt.Sprintf("push=%t", push), func(t *testing.T) {
 			f := newAgenticFixture(t, "manual")
 			f.passFirstStage()
-			f.reconcile(t, nil)
+			f.reconcile(t, f.command(1, "required"))
 			skip := f.command(100, "skip-agentic-mode")
 			f.gh.failCommentAfterWrite = true
 			f.reconcile(t, skip)
@@ -836,6 +848,8 @@ func TestAgenticConfirmationFailureDoesNotReplayModeChange(t *testing.T) {
 			f.reconcile(t, skip)
 			require.False(t, hasAgenticLabel(&f.gh.pr, agenticSkipLabel), "a handled skip cannot overwrite a later manual label removal")
 			require.False(t, f.state().traditionalMode())
+			require.Len(t, f.gh.checks, 1, "manual restoration must wait for a new command")
+			f.reconcile(t, f.command(200, "required"))
 			require.Equal(t, agenticCheckTitle, f.gh.checks[len(f.gh.checks)-1].Output.Title)
 		})
 	}
@@ -877,7 +891,7 @@ func TestAgenticDeferredRestoreRerunFailurePreservesOwnershipAfterRestart(t *tes
 func TestAgenticIncompleteOptOutRemovalAcrossRestart(t *testing.T) {
 	f := newAgenticFixture(t, "manual")
 	f.passFirstStage()
-	f.reconcile(t, nil)
+	f.reconcile(t, f.command(1, "required"))
 	f.reconcile(t, f.command(100, "skip-agentic-mode"))
 	require.Equal(t, "queued", f.gh.checks[0].Status)
 	require.Equal(t, traditionalCheckTitle, f.gh.checks[0].Output.Title)
@@ -885,6 +899,9 @@ func TestAgenticIncompleteOptOutRemovalAcrossRestart(t *testing.T) {
 	f.a.states = nil
 	f.reconcile(t, nil)
 	require.False(t, f.state().traditionalMode(), "removing an incomplete opt-out must restore agentic readiness, even after restart")
+	require.Len(t, f.gh.checks, 1, "manual restoration must not create readiness automatically")
+	require.True(t, f.state().waitingUntil.IsZero())
+	f.reconcile(t, f.command(200, "required"))
 	require.Len(t, f.gh.checks, 2)
 	require.Equal(t, agenticCheckTitle, f.gh.checks[1].Output.Title)
 	require.False(t, f.state().waitingUntil.IsZero())
@@ -928,6 +945,8 @@ func TestAgenticRestoreAfterTraditionalDispatchFailure(t *testing.T) {
 						}
 						if !historical {
 							require.False(t, f.state().traditionalMode(), "an initial failed dispatch can restore agentic mode immediately")
+							require.Len(t, f.gh.checks, 1, "restoring manual mode must wait for a handoff command")
+							f.reconcile(t, f.command(600, "required"))
 							require.Len(t, f.gh.checks, 2)
 							require.Equal(t, agenticCheckTitle, f.gh.checks[1].Output.Title)
 							return
@@ -963,7 +982,7 @@ func TestAgenticManualOptOutKeepsDurableCompletedOwner(t *testing.T) {
 			t.Run(fmt.Sprintf("traditional-write=%t/restart=%t", traditionalWrite, restart), func(t *testing.T) {
 				f := newAgenticFixture(t, "manual")
 				f.passFirstStage()
-				f.reconcile(t, nil)
+				f.reconcile(t, f.command(1, "required"))
 				f.reconcile(t, f.command(100, "mark-pipeline-gate"))
 				completed := f.gh.checks[0]
 				f.gh.pr.Labels = []github.Label{{Name: agenticSkipLabel}}
@@ -1014,6 +1033,8 @@ func TestAgenticHistoricalRerunRetargetClearsOwnership(t *testing.T) {
 			require.Equal(t, "failure", f.gh.checks[0].Conclusion)
 			f.passFirstStage()
 			f.reconcile(t, nil)
+			require.Len(t, f.gh.checks, 1, "retargeted manual mode still requires a command")
+			f.reconcile(t, f.command(500, "required"))
 			require.Len(t, f.gh.checks, 2)
 			require.Equal(t, agenticCheckTitle, f.gh.checks[1].Output.Title)
 			require.False(t, f.state().traditionalMode())
@@ -1024,7 +1045,7 @@ func TestAgenticHistoricalRerunRetargetClearsOwnership(t *testing.T) {
 func TestAgenticMutationFailureRemainsRetryable(t *testing.T) {
 	f := newAgenticFixture(t, "manual")
 	f.passFirstStage()
-	f.reconcile(t, nil)
+	f.reconcile(t, f.command(1, "required"))
 	f.reconcile(t, f.command(100, "mark-pipeline-gate"))
 	f.gh.failLabel = true
 	skip := f.command(200, "skip-agentic-mode")
@@ -1068,7 +1089,7 @@ func TestAgenticSkipInvalidatesCompletionBeforeTraditionalDispatch(t *testing.T)
 		t.Run(scenario, func(t *testing.T) {
 			f := newAgenticFixture(t, "manual")
 			f.passFirstStage()
-			f.reconcile(t, nil)
+			f.reconcile(t, f.command(1, "required"))
 			f.reconcile(t, f.command(100, "mark-pipeline-gate"))
 			f.gh.failLabelAfterWrite = scenario == "lost-label-response"
 			skip := f.command(200, "skip-agentic-mode")
@@ -1195,121 +1216,37 @@ func TestAgenticFailedPublicationAndFallbackRetry(t *testing.T) {
 	require.Equal(t, "success", f.gh.checks[0].Conclusion)
 }
 
-// TestAgenticManualCommandsPublishReadinessOnce covers early handoff and reuse across later events and restart.
+// TestAgenticManualCommandsPublishReadinessOnce covers command-only manual handoff and reuse.
 func TestAgenticManualCommandsPublishReadinessOnce(t *testing.T) {
-	for _, tc := range []struct {
-		name, mode, command string
-		untrusted           bool
-		collaborator        bool
-		lostReply           bool
-	}{
-		{name: "auto-required", mode: "auto", command: "required"},
-		{name: "auto-remaining", mode: "auto", command: "remaining"},
-		{name: "manual-required", mode: "manual", command: "required"},
-		{name: "manual-remaining", mode: "manual", command: "remaining"},
-		{name: "lgtm-required", mode: "lgtm", command: "required"},
-		{name: "lgtm-remaining", mode: "lgtm", command: "remaining"},
-		{name: "untrusted-required", mode: "lgtm", command: "required", untrusted: true},
-		{name: "untrusted-remaining", mode: "lgtm", command: "remaining", untrusted: true},
-		{name: "collaborator-required", mode: "lgtm", command: "required", collaborator: true},
-		{name: "collaborator-remaining", mode: "lgtm", command: "remaining", collaborator: true},
-		{name: "lost-reply-required", mode: "lgtm", command: "required", lostReply: true},
-		{name: "lost-reply-remaining", mode: "lgtm", command: "remaining", lostReply: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newAgenticFixture(t, tc.mode)
-			f.a.reader = errorLister{} // Explicit handoff must not consult first-stage jobs.
-			f.gh.member = !tc.untrusted && !tc.collaborator
-			f.gh.collaborator = tc.collaborator
-			command := f.command(100, tc.command)
-			f.reconcile(t, command)
-			if tc.untrusted {
-				require.Empty(t, f.gh.checks)
-				require.Empty(t, f.gh.comments)
-				require.Zero(t, f.gh.statusWrites)
-				require.True(t, f.state().waitingUntil.IsZero())
-				return
-			}
+	for _, command := range []string{"required", "remaining"} {
+		t.Run(command, func(t *testing.T) {
+			f := newAgenticFixture(t, "manual")
+			f.passFirstStage()
+			f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}, {Name: PipelineAutoLabel}}
+			f.reconcile(t, nil)
+			require.Empty(t, f.gh.checks, "first-stage success and approval must not start manual handoff")
+			require.True(t, f.state().waitingUntil.IsZero())
+
+			f.gh.pr.Labels = nil
+			f.a.reader = errorLister{}
+			f.reconcile(t, f.command(100, command))
 			require.Len(t, f.gh.checks, 1)
 			gate, deadline := f.gh.checks[0], f.state().waitingUntil
-			require.Equal(t, pipelineGate, gate.Name)
 			require.Equal(t, "queued", gate.Status)
 			require.Equal(t, agenticCheckTitle, gate.Output.Title)
-			require.Contains(t, gate.Output.Summary, "Chai handoff requested")
-			require.NotContains(t, gate.Output.Summary, "First-stage tests passed")
-			require.Equal(t, f.now.Add(f.a.options.timeout), deadline)
+			require.False(t, deadline.IsZero())
 			require.Empty(t, f.gh.comments)
-			require.Zero(t, f.gh.statusWrites)
 
 			f.now = f.now.Add(time.Minute)
-			f.reconcile(t, command) // Duplicate webhook delivery.
-			require.Empty(t, f.gh.comments, "duplicate delivery must not produce a reply")
-			repeated := f.command(200, tc.command)
-			f.gh.failCommentAfterWrite = tc.lostReply
-			f.reconcile(t, repeated)
-			f.reconcile(t, repeated)
-			require.Len(t, f.gh.comments, 1, "reply delivery failures must not replay the command or reply")
-			f.reconcile(t, f.command(300, "remaining"))
-			require.Len(t, f.gh.comments, 2)
-			for _, comment := range f.gh.comments {
-				require.Contains(t, comment.Body, "only once per HEAD SHA")
-				require.Contains(t, comment.Body, f.gh.pr.Head.SHA)
-				require.Contains(t, comment.Body, "will not trigger Chai again")
-				require.Contains(t, comment.Body, "does not reopen the gate or restart its response timeout")
-			}
-			f.reconcile(t, nil) // Automatic reconcile before first-stage completion.
+			f.reconcile(t, f.command(200, command))
 			f.passFirstStage()
 			f.reconcile(t, nil)
-			f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
-			f.reconcile(t, nil)
-			if tc.mode == "lgtm" {
-				f.reconcile(t, f.command(400, "auto"))
-			}
-			f.gh.pr.Labels = []github.Label{{Name: PipelineAutoLabel}}
-			f.reconcile(t, nil)
-			if diff := cmp.Diff([]github.CheckRun{gate}, f.gh.checks); diff != "" {
-				t.Errorf("unexpected result (-want +got):\n%s", diff)
-			}
-			require.Equal(t, deadline, f.state().waitingUntil, "later commands and approval must not refresh the response timeout")
+			require.Equal(t, []github.CheckRun{gate}, f.gh.checks)
+			require.Equal(t, deadline, f.state().waitingUntil)
 			require.Equal(t, 1, f.gh.checkAttempts)
-			require.Len(t, f.gh.comments, 2, "automatic events must not produce command replies")
-			require.Zero(t, f.gh.statusWrites)
-
-			f.a.states = nil
-			f.a.reader = errorLister{}
-			f.reconcile(t, f.command(500, tc.command))
-			require.Equal(t, []github.CheckRun{gate}, f.gh.checks, "restart must reuse the pending gate")
-			require.Len(t, f.gh.comments, 3, "an existing pending gate must be explained after restart")
-			require.True(t, f.state().waitingUntil.IsZero(), "restart does not recover or restart a response timer")
-			mark := f.command(600, "mark-pipeline-gate "+f.gh.pr.Head.SHA)
-			mark.User.Login = "chai[bot]"
-			f.reconcile(t, mark)
-			completed := f.gh.checks[0]
-			require.Equal(t, "success", completed.Conclusion)
-			f.reconcile(t, f.command(700, "required"))
-			f.reconcile(t, f.command(800, "remaining"))
-			f.a.states = nil
-			f.now = f.now.Add(time.Hour)
-			f.reconcile(t, f.command(900, tc.command))
-			f.reconcile(t, nil)
-			require.Equal(t, []github.CheckRun{completed}, f.gh.checks, "manual and automatic events must preserve completed gates across restart")
-			require.True(t, f.state().dispatched)
-			require.True(t, f.state().waitingUntil.IsZero())
-			require.Len(t, f.gh.comments, 6, "commands against completed gates must also explain once-per-SHA behavior")
-			require.Zero(t, f.gh.statusWrites)
-
-			f.gh.pr.Head.SHA = strings.Repeat("b", 40)
-			f.gh.pr.Labels = nil
-			f.a.reader = newFakePJLister()
-			f.reconcile(t, nil)
-			require.Len(t, f.gh.checks, 1, "automatic handoff still waits for the configured prerequisites on a new SHA")
-			f.reconcile(t, f.command(1000, tc.command))
-			require.Len(t, f.gh.checks, 2)
-			require.Equal(t, completed, f.gh.checks[0])
-			require.Equal(t, f.gh.pr.Head.SHA, f.gh.checks[1].HeadSHA)
-			require.Equal(t, "queued", f.gh.checks[1].Status)
-			require.Equal(t, f.now.Add(f.a.options.timeout), f.state().waitingUntil)
-			require.Len(t, f.gh.comments, 6, "a new SHA starts a handoff without an already-triggered reply")
+			require.Len(t, f.gh.comments, 1)
+			require.Contains(t, f.gh.comments[0].Body, "only once per HEAD SHA")
+			require.Contains(t, f.gh.comments[0].Body, f.gh.pr.Head.SHA)
 			require.Zero(t, f.gh.statusWrites)
 		})
 	}
@@ -1362,7 +1299,7 @@ func TestAgenticRetargetInvalidatesCompletionBeforeReadiness(t *testing.T) {
 func TestAgenticFallbackManualCommandAndReenable(t *testing.T) {
 	f := newAgenticFixture(t, "manual")
 	f.passFirstStage()
-	f.reconcile(t, nil)
+	f.reconcile(t, f.command(1, "required"))
 	f.now = f.state().waitingUntil
 	f.reconcile(t, nil)
 	f.reconcile(t, f.command(100, "remaining"))
@@ -1378,65 +1315,26 @@ func TestAgenticFallbackManualCommandAndReenable(t *testing.T) {
 	require.True(t, f.state().waitingUntil.IsZero())
 }
 
-// TestAgenticFreshReadinessRetryDoesNotDuplicateCreation covers ambiguous creation responses and persisted completion.
 func TestAgenticFreshReadinessRetryDoesNotDuplicateCreation(t *testing.T) {
-	for _, tc := range []struct {
-		name, command string
-		reply         bool
-		completed     bool
-		restart       bool
-	}{
-		{name: "restore-pending", command: "agentic-mode"},
-		{name: "restore-chai-reply", command: "agentic-mode", reply: true},
-		{name: "required-pending", command: "required"},
-		{name: "remaining-pending", command: "remaining"},
-		{name: "required-completed", command: "required", completed: true},
-		{name: "remaining-completed", command: "remaining", completed: true},
-		{name: "required-restart", command: "required", restart: true},
-		{name: "remaining-restart", command: "remaining", restart: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			mode := "lgtm"
-			if tc.command == "agentic-mode" {
-				mode = "manual"
-			}
-			f := newAgenticFixture(t, mode)
-			wantChecks := 1
-			if tc.command == "agentic-mode" {
-				f.passFirstStage()
-				f.reconcile(t, nil)
-				f.reconcile(t, f.command(100, "skip-agentic-mode"))
-				wantChecks = 2
-			}
-			publishedAt := f.now
-			command := f.command(200, tc.command)
+	for _, reply := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reply=%t", reply), func(t *testing.T) {
+			f := newAgenticFixture(t, "manual")
+			f.passFirstStage()
+			f.reconcile(t, f.command(1, "required"))
+			f.reconcile(t, f.command(100, "skip-agentic-mode"))
+			f.reconcile(t, f.command(200, "agentic-mode"))
 			f.gh.failCheckAfterCreate = true
+			command := f.command(250, "required")
 			require.Error(t, f.a.reconcilePull(context.Background(), f.work, command))
-			require.Len(t, f.gh.checks, wantChecks, "GitHub accepted the fresh readiness despite a lost response")
-			if tc.completed {
-				require.NoError(t, f.a.checks.markGateWithTitle(pullRefs(f.work.org, f.work.repo, &f.gh.pr), 300, agenticCheckTitle))
+			require.Len(t, f.gh.checks, 2, "GitHub accepted the fresh readiness despite a lost response")
+			f.a.reader = errorLister{}
+			var comment *github.IssueComment
+			if reply {
+				comment = &github.IssueComment{ID: 300, Body: "Chai is reviewing this PR.", User: github.User{Login: "chai[bot]"}, CreatedAt: f.now}
 			}
-			gate := f.gh.checks[wantChecks-1]
-			if tc.restart {
-				f.a.states = nil
-			}
-			f.now = f.now.Add(time.Minute)
-			retry := command
-			if tc.command == "agentic-mode" {
-				retry = nil
-			}
-			if tc.reply {
-				retry = &github.IssueComment{ID: 300, Body: "Chai is reviewing this PR.", User: github.User{Login: "chai[bot]"}, CreatedAt: f.now}
-			}
-			f.reconcile(t, retry)
-			require.Len(t, f.gh.checks, wantChecks, "retry must reuse the queued check, not start Chai twice")
-			require.Equal(t, gate, f.gh.checks[wantChecks-1])
-			require.Equal(t, tc.completed, f.state().dispatched)
-			if tc.reply || tc.completed || tc.restart {
-				require.True(t, f.state().waitingUntil.IsZero(), "responses, completion and restart must not start a new timer")
-				return
-			}
-			require.Equal(t, publishedAt.Add(f.a.options.timeout), f.state().waitingUntil, "a retry must retain the original response deadline")
+			f.reconcile(t, comment)
+			require.Len(t, f.gh.checks, 2, "retry must reuse the queued check, not start Chai twice")
+			require.Equal(t, reply, f.state().waitingUntil.IsZero(), "a reply during the lost response must cancel the timer")
 		})
 	}
 }
@@ -1444,7 +1342,7 @@ func TestAgenticFreshReadinessRetryDoesNotDuplicateCreation(t *testing.T) {
 func TestAgenticPendingReadinessSurvivesRestartWithoutTimerRecovery(t *testing.T) {
 	f := newAgenticFixture(t, "manual")
 	f.passFirstStage()
-	f.reconcile(t, nil)
+	f.reconcile(t, f.command(1, "required"))
 	f.a.states, f.a.reader = nil, errorLister{}
 	f.now = f.now.Add(time.Hour)
 	f.reconcile(t, nil)
@@ -1472,7 +1370,7 @@ func TestAgenticReenablePreservesCompletedDispatchWithoutFirstStageJobs(t *testi
 func TestAgenticRetiredGateCannotAuthorizeChaiReadinessAfterRestart(t *testing.T) {
 	f := newAgenticFixture(t, "manual")
 	f.passFirstStage()
-	f.reconcile(t, nil)
+	f.reconcile(t, f.command(1, "required"))
 	f.reconcile(t, f.command(100, "mark-pipeline-gate"))
 	f.reconcile(t, f.command(200, "skip-agentic-mode"))
 	f.a.reader = newFakePJLister()
@@ -1578,7 +1476,7 @@ func TestAgenticChaiCannotMarkChangedGateWithStaleReadiness(t *testing.T) {
 		t.Run(scenario, func(t *testing.T) {
 			f := newAgenticFixture(t, "manual")
 			f.passFirstStage()
-			f.reconcile(t, nil)
+			f.reconcile(t, f.command(1, "required"))
 			switch scenario {
 			case "retired":
 				f.gh.checks[0].Status, f.gh.checks[0].Conclusion = "completed", "failure"

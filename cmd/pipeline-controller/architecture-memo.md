@@ -8,10 +8,12 @@ agentic mode. Chai owns second-stage execution unless a response timeout or
 
 ## Workflow
 
-- After applicable first-stage tests pass, create `ci/pipeline-gate`
+- In automatic mode, after applicable first-stage tests pass, create `ci/pipeline-gate`
   pending (`queued`). In LGTM mode, also require the current `lgtm` label or
   `pipeline-auto` override before creating readiness or starting its response timeout.
-  Either condition may arrive first. A trusted user's `/pipeline required` or
+  Either condition may arrive first. Manual mode requires an explicit handoff command;
+  first-stage success and approval labels alone do not create its gate.
+  A trusted user's `/pipeline required` or
   `/pipeline remaining` creates readiness immediately, even before first-stage success
   and without LGTM. Both commands hand off to Chai; traditional mode keeps its existing
   force-set and missing-tests dispatch behavior.

@@ -40,6 +40,10 @@ A new push starts a fresh pipeline.
 
 In **Manual Mode**, the pipeline controller does not automatically trigger any tests. Users must manually trigger tests using commands.
 
+With agentic handoff enabled, `/pipeline required` or `/pipeline remaining` creates
+the pending gate and signals Chai. First-stage success, approval labels and other
+automatic events do not create that gate. Each new HEAD SHA needs a new command.
+
 **How it works:**
 - When a PR is opened, the controller posts information in jobs status section which jobs belong to second stage.
 - Users can trigger tests using:
@@ -248,11 +252,12 @@ Enable Chai in the main or LGTM enrollment configuration:
 Requires GitHub App authentication, `--agentic-trusted-author=<chai-login>`
 (repeatable) and optional `--agentic-timeout=20m`. There is no storage requirement.
 
-1. Applicable first-stage tests pass in the shared ProwJob cache (including overrides).
-   In LGTM mode, the PR must also currently carry `lgtm` or the `pipeline-auto`
-   label set by `/pipeline auto`; either approval or first-stage success may arrive first.
-   Automatic handoff waits for both conditions. A trusted user's `/pipeline required`
-   or `/pipeline remaining` requests handoff immediately, without either prerequisite.
+1. In automatic mode, applicable first-stage tests pass in the shared ProwJob cache
+   (including overrides). LGTM mode also requires the current `lgtm` or `pipeline-auto`
+   label set by `/pipeline auto`; either prerequisite may arrive first.
+   Manual mode waits for a trusted user's `/pipeline required` or `/pipeline remaining`.
+   In any mode, these commands request handoff immediately without waiting for
+   first-stage success or approval.
    Create `ci/pipeline-gate` **queued**; `check_run.created` signals Chai and starts its response timeout.
    Reuse the existing gate for the same PR HEAD SHA: repeated manual commands,
    first-stage completion, later LGTM or `pipeline-auto` labels, automatic reconciliation
@@ -282,9 +287,9 @@ After Chai responds there is no completion timeout: use `/pipeline skip-agentic-
   recovered. This title records earlier dispatch ownership, not current success.
   Chai completion cannot take ownership back on the completed traditional revision.
   An initial failed dispatch without earlier completion can still restore immediately.
-  Otherwise, a fresh readiness signal
-  is created after first-stage success and, in LGTM mode, current `lgtm` or
-  `pipeline-auto` approval. Already-agentic PRs are unchanged.
+  Otherwise, manual mode waits for `/pipeline required` or `/pipeline remaining`.
+  Automatic mode creates fresh readiness after first-stage success; LGTM mode also
+  requires current `lgtm` or `pipeline-auto` approval. Already-agentic PRs are unchanged.
 - Manual opt-out label removal also preserves completed dispatch. Repeat commands preserve it.
   A completed agentic gate keeps its agentic owner unless an actual traditional
   dispatch or acknowledgment while opted out writes traditional ownership.
