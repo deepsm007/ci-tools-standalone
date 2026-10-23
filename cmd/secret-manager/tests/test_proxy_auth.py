@@ -102,9 +102,38 @@ class ProxyAuthTest(unittest.TestCase):
                     proxy_auth.cache_path().chmod(0o644)
                 self.assertEqual(proxy_auth.cached_token(), token if valid else None)
         proxy_auth.cache_path().write_text("invalid json")
+        proxy_auth.cache_path().chmod(0o600)
         self.assertIsNone(proxy_auth.cached_token())
         proxy_auth.cache_path().unlink()
         self.assertIsNone(proxy_auth.cached_token())
+
+    def test_matches_login_value(self):
+        for name, value, expected, matches in [
+            ("equal", "nonce", "nonce", True),
+            ("different", "wrong", "nonce", False),
+            ("different lengths", "n", "nonce", False),
+            ("empty", "", "", False),
+            ("missing", None, "nonce", False),
+            ("list", ["nonce"], "nonce", False),
+            ("number", 123, "nonce", False),
+            ("bytes", b"nonce", "nonce", False),
+            ("non-ASCII", "nönce", "nonce", False),
+            ("missing expected", "nonce", None, False),
+            ("bytes expected", "nonce", b"nonce", False),
+            ("non-ASCII expected", "nonce", "nönce", False),
+        ]:
+            with self.subTest(name=name), patch.object(
+                proxy_auth.secrets,
+                "compare_digest",
+                wraps=proxy_auth.secrets.compare_digest,
+            ) as compare:
+                self.assertEqual(
+                    proxy_auth.matches_login_value(value, expected), matches
+                )
+                if name in ("equal", "different", "different lengths"):
+                    compare.assert_called_once_with(value, expected)
+                else:
+                    compare.assert_not_called()
 
     def test_verify_token(self):
         import base64
@@ -142,6 +171,9 @@ class ProxyAuthTest(unittest.TestCase):
                 False,
             ),
             ("wrong nonce", {}, "other", False),
+            ("missing nonce", {"nonce": None}, "nonce", False),
+            ("list nonce", {"nonce": ["nonce"]}, "nonce", False),
+            ("non-ASCII nonce", {"nonce": "nönce"}, "nonce", False),
         ]:
             with self.subTest(name=name), patch.object(
                 proxy_auth.requests, "get", return_value=response
@@ -162,12 +194,16 @@ class ProxyAuthTest(unittest.TestCase):
 
     def test_login(self):
         real_get = requests.get
-        for name in ("success", "denied", "timeout", "bad token"):
+        for name in (
+            "success", "denied", "timeout", "bad token", "no browser", "handoff"
+        ):
             with self.subTest(name=name):
                 threads = []
                 failures = []
 
                 def browser(url):
+                    if name == "no browser":
+                        return False
                     query = parse_qs(urlparse(url).query)
                     self.assertEqual(query["code_challenge_method"], ["S256"])
                     self.assertNotIn("client_secret", query)
@@ -175,13 +211,17 @@ class ProxyAuthTest(unittest.TestCase):
                     def callback():
                         try:
                             state = query["state"][0]
-                            invalid = real_get(
-                                proxy_auth.REDIRECT_URI
-                                + "?"
-                                + urlencode({"state": "wrong", "code": "bad"}),
-                                timeout=5,
-                            )
-                            self.assertEqual(invalid.status_code, 400)
+                            for invalid_state in ("wrong", "", "nönce", [state, state]):
+                                invalid = real_get(
+                                    proxy_auth.REDIRECT_URI
+                                    + "?"
+                                    + urlencode(
+                                        {"state": invalid_state, "code": "bad"},
+                                        doseq=True,
+                                    ),
+                                    timeout=5,
+                                )
+                                self.assertEqual(invalid.status_code, 400)
                             result = (
                                 {"state": state, "error": "access_denied"}
                                 if name == "denied"
@@ -200,6 +240,14 @@ class ProxyAuthTest(unittest.TestCase):
                         thread.start()
                     return True
 
+                request_path = Path(self.directory.name) / "browser-request"
+                real_replace = os.replace
+
+                def handoff(source, destination):
+                    real_replace(source, destination)
+                    self.assertEqual(request_path.stat().st_mode & 0o777, 0o600)
+                    browser(request_path.read_text())
+
                 response = Mock(status_code=200)
                 response.json.return_value = {"id_token": "dummy-token"}
                 with patch.dict(
@@ -216,9 +264,15 @@ class ProxyAuthTest(unittest.TestCase):
                     side_effect=ValueError() if name == "bad token" else None,
                 ), patch.object(
                     proxy_auth, "save_token"
-                ) as save:
+                ) as save, patch.object(
+                    proxy_auth.click, "echo"
+                ) as echo, patch.object(
+                    proxy_auth.os, "replace", side_effect=handoff
+                ), patch.dict(os.environ):
                     os.environ.pop("SM_BROWSER_REQUEST", None)
-                    if name == "success":
+                    if name == "handoff":
+                        os.environ["SM_BROWSER_REQUEST"] = str(request_path)
+                    if name in ("success", "handoff"):
                         self.assertEqual(proxy_auth.login(), "dummy-token")
                         save.assert_called_once_with("dummy-token")
                         data = exchange.call_args.kwargs["data"]
@@ -228,6 +282,9 @@ class ProxyAuthTest(unittest.TestCase):
                         with self.assertRaises(click.ClickException):
                             proxy_auth.login()
                         save.assert_not_called()
+                    echo.assert_called_once_with(
+                        "Opening SSO login in your browser.", err=True
+                    )
                 for thread in threads:
                     thread.join(timeout=5)
                     self.assertFalse(thread.is_alive())
@@ -242,6 +299,11 @@ class ProxyAuthTest(unittest.TestCase):
             ("upstream", [503], {}, False),
             ("redirect", [302], {}, False),
             ("malformed", [200], {"secrets": "wrong"}, False),
+            ("missing secrets", [200], {}, False),
+            ("null response", [200], None, False),
+            ("list response", [200], [], False),
+            ("string response", [200], "wrong", False),
+            ("number response", [200], 123, False),
         ]:
             with self.subTest(name=name):
                 responses = [
@@ -265,6 +327,10 @@ class ProxyAuthTest(unittest.TestCase):
                             list_secrets_from_proxy("collection")
                         if statuses[0] == 401:
                             self.assertIn("sm login", str(caught.exception))
+                        if statuses[0] == 200:
+                            self.assertEqual(
+                                str(caught.exception), "Could not read the response."
+                            )
                     login.assert_not_called()
                     request.assert_called_once()
                     self.assertFalse(request.call_args.kwargs["allow_redirects"])

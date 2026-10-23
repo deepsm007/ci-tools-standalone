@@ -111,7 +111,7 @@ def list_secrets_from_proxy(collection):
         ):
             raise ValueError("Invalid paths")
         return sorted(paths)
-    except (requests.RequestException, ValueError, KeyError) as error:
+    except (requests.RequestException, ValueError, KeyError, TypeError) as error:
         raise click.ClickException("Could not read the response.") from error
 
 

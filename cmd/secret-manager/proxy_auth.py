@@ -78,6 +78,20 @@ def cached_token():
     return None
 
 
+def matches_login_value(value, expected):
+    """matches_login_value compares nonempty ASCII login strings in constant time."""
+
+    return (
+        isinstance(value, str)
+        and isinstance(expected, str)
+        and bool(value)
+        and bool(expected)
+        and value.isascii()
+        and expected.isascii()
+        and secrets.compare_digest(value, expected)
+    )
+
+
 def verify_token(token, nonce):
     """verify_token checks a newly issued Dex token's signature and login claims."""
     header = jwt.decode_header(token)
@@ -102,7 +116,7 @@ def verify_token(token, nonce):
     if (
         claims.get("iss") != ISSUER
         or claims.get("aud") != CLIENT_ID
-        or claims.get("nonce") != nonce
+        or not matches_login_value(claims.get("nonce"), nonce)
     ):
         raise ValueError("Unexpected login claims")
 
@@ -131,7 +145,12 @@ def login():
         def do_GET(self):
             parsed = urlparse(self.path)
             query = parse_qs(parsed.query)
-            valid = parsed.path == "/callback" and query.get("state") == [state]
+            states = query.get("state", [])
+            valid = (
+                parsed.path == "/callback"
+                and len(states) == 1
+                and matches_login_value(states[0], state)
+            )
             if valid and not result:
                 if len(query.get("code", [])) == 1 and "error" not in query:
                     result["code"] = query["code"][0]
@@ -168,15 +187,23 @@ def login():
             (os.environ.get("SM_CALLBACK_HOST", "127.0.0.1"), 8085), Callback
         ) as server:
             server.timeout = 0.5
-            click.echo(
-                "Opening SSO login. If no browser opens, visit:\n" + url, err=True
-            )
+            click.echo("Opening SSO login in your browser.", err=True)
             browser_request = os.environ.get("SM_BROWSER_REQUEST")
             if browser_request:
-                Path(browser_request + ".tmp").write_text(url)
-                os.replace(browser_request + ".tmp", browser_request)
-            else:
-                webbrowser.open(url)
+                descriptor, temporary = tempfile.mkstemp(
+                    dir=Path(browser_request).parent
+                )
+                try:
+                    with os.fdopen(descriptor, "w") as output:
+                        output.write(url)
+                    os.replace(temporary, browser_request)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+            elif not webbrowser.open(url):
+                raise click.ClickException(
+                    "Could not open a browser. Run `login` in a browser-enabled environment."
+                )
             deadline = time.monotonic() + LOGIN_TIMEOUT
             while not result and time.monotonic() < deadline:
                 server.handle_request()
