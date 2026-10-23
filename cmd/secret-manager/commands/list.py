@@ -2,6 +2,7 @@
 # pylint: disable=E0401, C0413
 
 import json
+import os
 
 import click
 import proxy_auth
@@ -85,6 +86,12 @@ def list_collections_for_rover_group(
 
 
 def list_secrets_from_proxy(collection):
+    # Only the current wrapper script sets SM_AUTH_DIR and forwards the SSO login callback.
+    # This can be removed once we've moved everything to go through the proxy.
+    if "SM_AUTH_DIR" not in os.environ:
+        raise click.ClickException(
+            "Your hack/secret-manager.sh is outdated. Run `git pull` in your openshift/release checkout, then retry."
+        )
     token = proxy_auth.get_token()
     try:
         response = requests.get(

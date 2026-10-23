@@ -312,6 +312,7 @@ class ProxyAuthTest(unittest.TestCase):
             ("list response", [200], [], False),
             ("string response", [200], "wrong", False),
             ("number response", [200], 123, False),
+            ("outdated wrapper", [], {}, False),
         ]:
             with self.subTest(name=name):
                 responses = [
@@ -320,11 +321,13 @@ class ProxyAuthTest(unittest.TestCase):
                 ]
                 with patch.object(
                     proxy_auth, "get_token", return_value="cached"
-                ), patch.object(
+                ) as get_token, patch.object(
                     proxy_auth, "login", return_value="fresh"
                 ) as login, patch(
                     "commands.list.requests.get", side_effect=responses
-                ) as request:
+                ) as request, patch.dict(os.environ):
+                    if not statuses:
+                        del os.environ["SM_AUTH_DIR"]
                     if valid:
                         self.assertEqual(
                             list_secrets_from_proxy("collection"),
@@ -333,6 +336,11 @@ class ProxyAuthTest(unittest.TestCase):
                     else:
                         with self.assertRaises(click.ClickException) as caught:
                             list_secrets_from_proxy("collection")
+                        if not statuses:
+                            self.assertIn("git pull", str(caught.exception))
+                            get_token.assert_not_called()
+                            request.assert_not_called()
+                            continue
                         if statuses[0] == 401:
                             self.assertIn("sm login", str(caught.exception))
                         if statuses[0] == 200:
