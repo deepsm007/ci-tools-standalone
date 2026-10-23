@@ -33,7 +33,13 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 	switch command.name {
 	case "required", "remaining":
 		if !s.traditionalMode() {
-			reply("The controller does not dispatch second-stage tests in agentic mode. Use `/pipeline skip-agentic-mode` first, then repeat this command. The request was not queued.")
+			created := false
+			if !s.ready {
+				created, err = a.publishReadiness(work, s, pr)
+			}
+			if err == nil && !created {
+				reply(fmt.Sprintf("Agentic mode triggers Chai only once per HEAD SHA. `ci/pipeline-gate` already exists for `%s`. Repeating `/pipeline required` or `/pipeline remaining` will not trigger Chai again. This command does not reopen the gate or restart its response timeout.", pr.Head.SHA))
+			}
 			break
 		}
 		if command.name == "remaining" && s.dispatched {

@@ -808,8 +808,9 @@ func TestAgenticDeferredRestoreRetainsTraditionalCommands(t *testing.T) {
 					f.a.reader = newFakePJLister()
 					f.reconcile(t, f.command(800, "required"))
 					require.False(t, f.state().traditionalMode(), "the next revision returns to agentic ownership")
-					require.Contains(t, f.gh.comments[len(f.gh.comments)-1].Body, "not queued")
-					require.True(t, f.state().waitingUntil.IsZero())
+					require.Len(t, f.gh.checks, 2)
+					require.Equal(t, agenticCheckTitle, f.gh.checks[1].Output.Title)
+					require.False(t, f.state().waitingUntil.IsZero(), "an explicit command starts the next revision immediately")
 				})
 			}
 		}
@@ -1194,16 +1195,124 @@ func TestAgenticFailedPublicationAndFallbackRetry(t *testing.T) {
 	require.Equal(t, "success", f.gh.checks[0].Conclusion)
 }
 
-func TestAgenticTraditionalCommandsAreNotQueued(t *testing.T) {
-	f := newAgenticFixture(t, "auto")
-	f.passFirstStage()
-	f.reconcile(t, f.command(100, "required"))
-	require.Len(t, f.gh.comments, 1)
-	require.Contains(t, f.gh.comments[0].Body, "not queued")
-	require.NotContains(t, f.gh.comments[0].Body, "/test e2e")
-	f.reconcile(t, nil)
-	require.Len(t, f.gh.comments, 1)
-	require.Zero(t, f.gh.statusWrites)
+// TestAgenticManualCommandsPublishReadinessOnce covers early handoff and reuse across later events and restart.
+func TestAgenticManualCommandsPublishReadinessOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode, command string
+		untrusted           bool
+		collaborator        bool
+		lostReply           bool
+	}{
+		{name: "auto-required", mode: "auto", command: "required"},
+		{name: "auto-remaining", mode: "auto", command: "remaining"},
+		{name: "manual-required", mode: "manual", command: "required"},
+		{name: "manual-remaining", mode: "manual", command: "remaining"},
+		{name: "lgtm-required", mode: "lgtm", command: "required"},
+		{name: "lgtm-remaining", mode: "lgtm", command: "remaining"},
+		{name: "untrusted-required", mode: "lgtm", command: "required", untrusted: true},
+		{name: "untrusted-remaining", mode: "lgtm", command: "remaining", untrusted: true},
+		{name: "collaborator-required", mode: "lgtm", command: "required", collaborator: true},
+		{name: "collaborator-remaining", mode: "lgtm", command: "remaining", collaborator: true},
+		{name: "lost-reply-required", mode: "lgtm", command: "required", lostReply: true},
+		{name: "lost-reply-remaining", mode: "lgtm", command: "remaining", lostReply: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAgenticFixture(t, tc.mode)
+			f.a.reader = errorLister{} // Explicit handoff must not consult first-stage jobs.
+			f.gh.member = !tc.untrusted && !tc.collaborator
+			f.gh.collaborator = tc.collaborator
+			command := f.command(100, tc.command)
+			f.reconcile(t, command)
+			if tc.untrusted {
+				require.Empty(t, f.gh.checks)
+				require.Empty(t, f.gh.comments)
+				require.Zero(t, f.gh.statusWrites)
+				require.True(t, f.state().waitingUntil.IsZero())
+				return
+			}
+			require.Len(t, f.gh.checks, 1)
+			gate, deadline := f.gh.checks[0], f.state().waitingUntil
+			require.Equal(t, pipelineGate, gate.Name)
+			require.Equal(t, "queued", gate.Status)
+			require.Equal(t, agenticCheckTitle, gate.Output.Title)
+			require.Contains(t, gate.Output.Summary, "Chai handoff requested")
+			require.NotContains(t, gate.Output.Summary, "First-stage tests passed")
+			require.Equal(t, f.now.Add(f.a.options.timeout), deadline)
+			require.Empty(t, f.gh.comments)
+			require.Zero(t, f.gh.statusWrites)
+
+			f.now = f.now.Add(time.Minute)
+			f.reconcile(t, command) // Duplicate webhook delivery.
+			require.Empty(t, f.gh.comments, "duplicate delivery must not produce a reply")
+			repeated := f.command(200, tc.command)
+			f.gh.failCommentAfterWrite = tc.lostReply
+			f.reconcile(t, repeated)
+			f.reconcile(t, repeated)
+			require.Len(t, f.gh.comments, 1, "reply delivery failures must not replay the command or reply")
+			f.reconcile(t, f.command(300, "remaining"))
+			require.Len(t, f.gh.comments, 2)
+			for _, comment := range f.gh.comments {
+				require.Contains(t, comment.Body, "only once per HEAD SHA")
+				require.Contains(t, comment.Body, f.gh.pr.Head.SHA)
+				require.Contains(t, comment.Body, "will not trigger Chai again")
+				require.Contains(t, comment.Body, "does not reopen the gate or restart its response timeout")
+			}
+			f.reconcile(t, nil) // Automatic reconcile before first-stage completion.
+			f.passFirstStage()
+			f.reconcile(t, nil)
+			f.gh.pr.Labels = []github.Label{{Name: labels.LGTM}}
+			f.reconcile(t, nil)
+			if tc.mode == "lgtm" {
+				f.reconcile(t, f.command(400, "auto"))
+			}
+			f.gh.pr.Labels = []github.Label{{Name: PipelineAutoLabel}}
+			f.reconcile(t, nil)
+			if diff := cmp.Diff([]github.CheckRun{gate}, f.gh.checks); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+			}
+			require.Equal(t, deadline, f.state().waitingUntil, "later commands and approval must not refresh the response timeout")
+			require.Equal(t, 1, f.gh.checkAttempts)
+			require.Len(t, f.gh.comments, 2, "automatic events must not produce command replies")
+			require.Zero(t, f.gh.statusWrites)
+
+			f.a.states = nil
+			f.a.reader = errorLister{}
+			f.reconcile(t, f.command(500, tc.command))
+			require.Equal(t, []github.CheckRun{gate}, f.gh.checks, "restart must reuse the pending gate")
+			require.Len(t, f.gh.comments, 3, "an existing pending gate must be explained after restart")
+			require.True(t, f.state().waitingUntil.IsZero(), "restart does not recover or restart a response timer")
+			mark := f.command(600, "mark-pipeline-gate "+f.gh.pr.Head.SHA)
+			mark.User.Login = "chai[bot]"
+			f.reconcile(t, mark)
+			completed := f.gh.checks[0]
+			require.Equal(t, "success", completed.Conclusion)
+			f.reconcile(t, f.command(700, "required"))
+			f.reconcile(t, f.command(800, "remaining"))
+			f.a.states = nil
+			f.now = f.now.Add(time.Hour)
+			f.reconcile(t, f.command(900, tc.command))
+			f.reconcile(t, nil)
+			require.Equal(t, []github.CheckRun{completed}, f.gh.checks, "manual and automatic events must preserve completed gates across restart")
+			require.True(t, f.state().dispatched)
+			require.True(t, f.state().waitingUntil.IsZero())
+			require.Len(t, f.gh.comments, 6, "commands against completed gates must also explain once-per-SHA behavior")
+			require.Zero(t, f.gh.statusWrites)
+
+			f.gh.pr.Head.SHA = strings.Repeat("b", 40)
+			f.gh.pr.Labels = nil
+			f.a.reader = newFakePJLister()
+			f.reconcile(t, nil)
+			require.Len(t, f.gh.checks, 1, "automatic handoff still waits for the configured prerequisites on a new SHA")
+			f.reconcile(t, f.command(1000, tc.command))
+			require.Len(t, f.gh.checks, 2)
+			require.Equal(t, completed, f.gh.checks[0])
+			require.Equal(t, f.gh.pr.Head.SHA, f.gh.checks[1].HeadSHA)
+			require.Equal(t, "queued", f.gh.checks[1].Status)
+			require.Equal(t, f.now.Add(f.a.options.timeout), f.state().waitingUntil)
+			require.Len(t, f.gh.comments, 6, "a new SHA starts a handoff without an already-triggered reply")
+			require.Zero(t, f.gh.statusWrites)
+		})
+	}
 }
 
 func TestAgenticOptOutPersistsAcrossPush(t *testing.T) {
@@ -1269,23 +1378,65 @@ func TestAgenticFallbackManualCommandAndReenable(t *testing.T) {
 	require.True(t, f.state().waitingUntil.IsZero())
 }
 
+// TestAgenticFreshReadinessRetryDoesNotDuplicateCreation covers ambiguous creation responses and persisted completion.
 func TestAgenticFreshReadinessRetryDoesNotDuplicateCreation(t *testing.T) {
-	for _, reply := range []bool{false, true} {
-		t.Run(fmt.Sprintf("reply=%t", reply), func(t *testing.T) {
-			f := newAgenticFixture(t, "manual")
-			f.passFirstStage()
-			f.reconcile(t, nil)
-			f.reconcile(t, f.command(100, "skip-agentic-mode"))
-			f.gh.failCheckAfterCreate = true
-			require.Error(t, f.a.reconcilePull(context.Background(), f.work, f.command(200, "agentic-mode")))
-			require.Len(t, f.gh.checks, 2, "GitHub accepted the fresh readiness despite a lost response")
-			var comment *github.IssueComment
-			if reply {
-				comment = &github.IssueComment{ID: 300, Body: "Chai is reviewing this PR.", User: github.User{Login: "chai[bot]"}, CreatedAt: f.now}
+	for _, tc := range []struct {
+		name, command string
+		reply         bool
+		completed     bool
+		restart       bool
+	}{
+		{name: "restore-pending", command: "agentic-mode"},
+		{name: "restore-chai-reply", command: "agentic-mode", reply: true},
+		{name: "required-pending", command: "required"},
+		{name: "remaining-pending", command: "remaining"},
+		{name: "required-completed", command: "required", completed: true},
+		{name: "remaining-completed", command: "remaining", completed: true},
+		{name: "required-restart", command: "required", restart: true},
+		{name: "remaining-restart", command: "remaining", restart: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mode := "lgtm"
+			if tc.command == "agentic-mode" {
+				mode = "manual"
 			}
-			f.reconcile(t, comment)
-			require.Len(t, f.gh.checks, 2, "retry must reuse the queued check, not start Chai twice")
-			require.Equal(t, reply, f.state().waitingUntil.IsZero(), "a reply during the lost response must cancel the timer")
+			f := newAgenticFixture(t, mode)
+			wantChecks := 1
+			if tc.command == "agentic-mode" {
+				f.passFirstStage()
+				f.reconcile(t, nil)
+				f.reconcile(t, f.command(100, "skip-agentic-mode"))
+				wantChecks = 2
+			}
+			publishedAt := f.now
+			command := f.command(200, tc.command)
+			f.gh.failCheckAfterCreate = true
+			require.Error(t, f.a.reconcilePull(context.Background(), f.work, command))
+			require.Len(t, f.gh.checks, wantChecks, "GitHub accepted the fresh readiness despite a lost response")
+			if tc.completed {
+				require.NoError(t, f.a.checks.markGateWithTitle(pullRefs(f.work.org, f.work.repo, &f.gh.pr), 300, agenticCheckTitle))
+			}
+			gate := f.gh.checks[wantChecks-1]
+			if tc.restart {
+				f.a.states = nil
+			}
+			f.now = f.now.Add(time.Minute)
+			retry := command
+			if tc.command == "agentic-mode" {
+				retry = nil
+			}
+			if tc.reply {
+				retry = &github.IssueComment{ID: 300, Body: "Chai is reviewing this PR.", User: github.User{Login: "chai[bot]"}, CreatedAt: f.now}
+			}
+			f.reconcile(t, retry)
+			require.Len(t, f.gh.checks, wantChecks, "retry must reuse the queued check, not start Chai twice")
+			require.Equal(t, gate, f.gh.checks[wantChecks-1])
+			require.Equal(t, tc.completed, f.state().dispatched)
+			if tc.reply || tc.completed || tc.restart {
+				require.True(t, f.state().waitingUntil.IsZero(), "responses, completion and restart must not start a new timer")
+				return
+			}
+			require.Equal(t, publishedAt.Add(f.a.options.timeout), f.state().waitingUntil, "a retry must retain the original response deadline")
 		})
 	}
 }

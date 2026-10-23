@@ -89,7 +89,9 @@ In **LGTM Mode**, the pipeline controller triggers second-stage tests when the `
 
 ## The `/pipeline required` Command
 
-The `/pipeline required` command works in **all three modes** and allows you to explicitly request that the pipeline controller trigger all required and necessary second-stage tests.
+The `/pipeline required` command works in **all three trigger modes**. In traditional mode, it explicitly requests all required and necessary second-stage tests.
+
+In [agentic mode](#agentic-handoff-chai), it immediately creates the pending Chai handoff gate, even before first-stage tests pass or LGTM is added. Repeated commands reuse the existing gate for this PR HEAD SHA, including after completion and restart. The force-rerun behavior below applies to traditional scheduling.
 
 **When to use `/pipeline required`:**
 - In Manual Mode: To trigger all required tests at once
@@ -101,7 +103,9 @@ The `/pipeline required` command works in **all three modes** and allows you to 
 
 ## The `/pipeline remaining` Command
 
-The `/pipeline remaining` command works in **all three modes** and schedules the required second-stage tests **minus** the jobs that already have a run at the current HEAD — the same "delta" the Automatic and LGTM modes compute automatically, but on demand.
+The `/pipeline remaining` command works in **all three trigger modes**. In traditional mode, it schedules the required second-stage tests **minus** the jobs that already have a run at the current HEAD, the same "delta" the Automatic and LGTM modes compute automatically, but on demand.
+
+In [agentic mode](#agentic-handoff-chai), it requests the same immediate Chai handoff as `/pipeline required`, without waiting for first-stage tests or LGTM. Both commands reuse one gate for the current PR HEAD SHA and leave test selection and dispatch to Chai.
 
 **How it differs from `/pipeline required`:**
 - `/pipeline required` force-schedules the **entire** required set, re-firing jobs that are already running and spending CI twice.
@@ -247,8 +251,14 @@ Requires GitHub App authentication, `--agentic-trusted-author=<chai-login>`
 1. Applicable first-stage tests pass in the shared ProwJob cache (including overrides).
    In LGTM mode, the PR must also currently carry `lgtm` or the `pipeline-auto`
    label set by `/pipeline auto`; either approval or first-stage success may arrive first.
-   Until both conditions hold, no readiness check or response timeout is created.
+   Automatic handoff waits for both conditions. A trusted user's `/pipeline required`
+   or `/pipeline remaining` requests handoff immediately, without either prerequisite.
    Create `ci/pipeline-gate` **queued**; `check_run.created` signals Chai and starts its response timeout.
+   Reuse the existing gate for the same PR HEAD SHA: repeated manual commands,
+   first-stage completion, later LGTM or `pipeline-auto` labels, automatic reconciliation
+   and restart do not create another gate, reopen completion or refresh the timeout.
+   A new SHA can start a new handoff under these same manual or automatic rules.
+   Explicit mode changes and retargeting retain their existing ownership rules.
 2. Any new comment from a configured Chai author after readiness and within the timeout
    cancels it; no acknowledgement command or HEAD is needed. The gate stays pending.
 3. Chai owns test selection, context publication and dispatch. It marks completion
@@ -278,7 +288,13 @@ After Chai responds there is no completion timeout: use `/pipeline skip-agentic-
 - Manual opt-out label removal also preserves completed dispatch. Repeat commands preserve it.
   A completed agentic gate keeps its agentic owner unless an actual traditional
   dispatch or acknowledgment while opted out writes traditional ownership.
-- `/pipeline required` and `/pipeline remaining` are rejected, not queued, while agentic.
+- `/pipeline required` and `/pipeline remaining` immediately request Chai handoff while
+  agentic, before first-stage success and without LGTM. They reuse an existing gate
+  and do not directly dispatch traditional `/test` jobs. Traditional mode retains
+  the full-set rerun and missing-tests behavior respectively.
+  When the gate already exists, each new command receives a reply explaining that
+  Chai is triggered only once per HEAD SHA. The command does not reopen the gate
+  or restart its response timeout.
   `/pipeline auto` sets the existing LGTM auto label and permits readiness after
   first-stage success without `lgtm`. Removing `lgtm` after readiness preserves the
   existing gate and response timeout; a new HEAD/base requires current approval again.

@@ -315,8 +315,11 @@ func (a *agenticController) publishReadiness(work agenticWork, s *agenticState, 
 	}
 	if !s.fresh && nativeAgenticReadiness(gate) {
 		s.gate, s.ready = *gate, true
-		if !s.publishedAt.IsZero() {
-			s.waitingUntil = a.currentTime().Add(a.options.timeout) // A lost creation response was confirmed by this retry.
+		s.dispatched = gate.Status == "completed" && gate.Conclusion == "success"
+		if s.dispatched {
+			s.waitingUntil = time.Time{}
+		} else if !s.publishedAt.IsZero() {
+			s.waitingUntil = s.publishedAt.Add(a.options.timeout) // Preserve the original deadline after a lost creation response.
 		}
 		return false, nil // Restarts do not recover response timers.
 	}
@@ -325,7 +328,7 @@ func (a *agenticController) publishReadiness(work agenticWork, s *agenticState, 
 			return false, err
 		}
 	}
-	next := traditionalCheck(refs, "queued", "", fmt.Sprintf("First-stage tests passed. Any new Chai comment within %s cancels traditional fallback. The gate stays pending until `/pipeline mark-pipeline-gate %s`. Individual test contexts gate results.", a.options.timeout, s.head))
+	next := traditionalCheck(refs, "queued", "", fmt.Sprintf("Chai handoff requested. Any new Chai comment within %s cancels traditional fallback. The gate stays pending until `/pipeline mark-pipeline-gate %s`. Individual test contexts gate results.", a.options.timeout, s.head))
 	next.Output.Title = agenticCheckTitle
 	s.fresh, s.publishedAt = false, a.currentTime().Truncate(time.Second)
 	id, err := a.gh.CreateCheckRun(work.org, work.repo, next)
@@ -334,7 +337,7 @@ func (a *agenticController) publishReadiness(work agenticWork, s *agenticState, 
 	}
 	next.ID, next.App.ID = id, a.appID
 	s.gate, s.ready, s.fresh = next, true, false
-	s.waitingUntil = a.currentTime().Add(a.options.timeout)
+	s.waitingUntil = s.publishedAt.Add(a.options.timeout)
 	return true, nil
 }
 
