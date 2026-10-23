@@ -110,7 +110,9 @@ def list_secrets_from_proxy(collection):
         )
     if response.status_code == 403:
         raise click.ClickException(
-            f"You don't have permission to list collection '{collection}'."
+            f"You don't have permission to list collection '{collection}', or it doesn't exist. "
+            "To see the collections a Rover group owns, run `list --rover-group <group>`. "
+            "If you were recently added to an owning Rover group, run the `login` command and retry."
         )
     if response.status_code != 200:
         raise click.ClickException(

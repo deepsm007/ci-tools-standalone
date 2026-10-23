@@ -314,7 +314,7 @@ class ProxyAuthTest(unittest.TestCase):
             ("success", reply(200, {"secrets": ["z/a", "a/b"]}), ["a/b", "z/a"]),
             ("empty", reply(200, {"secrets": []}), []),
             ("unauthorized", reply(401), "Run the `login` command"),
-            ("forbidden", reply(403), "don't have permission"),
+            ("forbidden", reply(403), "recently added to an owning Rover group"),
             ("server error", reply(503), "Listing secrets failed (HTTP 503)"),
             ("network failure", requests.ConnectionError(), "network connection"),
             ("secrets not a list", reply(200, {"secrets": "a/b"}), "invalid response"),
