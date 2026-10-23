@@ -25,6 +25,8 @@ REDIRECT_URI = "http://127.0.0.1:8085/callback"
 LOGIN_TIMEOUT = 180
 TOKEN_MAX_AGE = 3600
 TOKEN_RELOGIN_MARGIN = 180
+# CLOCK_SKEW is how far, in seconds, a token's issue time may be ahead of the local clock.
+CLOCK_SKEW = 60
 
 
 def cache_path():
@@ -55,7 +57,8 @@ def save_token(token):
 
 
 def cached_token():
-    """cached_token returns a token until three minutes before its proxy age limit or expiry."""
+    """cached_token returns a token until three minutes before its proxy age limit or expiry,
+    accepting issue times up to CLOCK_SKEW seconds ahead of the local clock."""
 
     try:
         path = cache_path()
@@ -69,7 +72,7 @@ def cached_token():
         if (
             claims.get("iss") == ISSUER
             and claims.get("aud") == CLIENT_ID
-            and claims["iat"] <= now
+            and claims["iat"] <= now + CLOCK_SKEW
             and valid_until > now + TOKEN_RELOGIN_MARGIN
         ):
             return token
@@ -112,7 +115,9 @@ def verify_token(token, nonce):
     pem = public_key.public_bytes(
         serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
     )
-    claims = jwt.decode(token, certs=pem, audience=CLIENT_ID)
+    claims = jwt.decode(
+        token, certs=pem, audience=CLIENT_ID, clock_skew_in_seconds=CLOCK_SKEW
+    )
     if (
         claims.get("iss") != ISSUER
         or claims.get("aud") != CLIENT_ID

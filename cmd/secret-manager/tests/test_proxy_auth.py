@@ -73,7 +73,8 @@ class ProxyAuthTest(unittest.TestCase):
             ("within renewal window", {"iat": now - 3500}, False, False),
             ("at maximum age", {"iat": now - 3600}, False, False),
             ("over maximum age", {"iat": now - 7200}, False, False),
-            ("future issuance", {"iat": now + 1}, False, False),
+            ("future issuance within clock skew", {"iat": now + 60}, False, True),
+            ("future issuance beyond clock skew", {"iat": now + 61}, False, False),
             ("missing issuance", {"iat": None}, False, False),
             ("expired", {"exp": now - 1}, False, False),
             ("Dex expiry renewal window", {"exp": now + 180}, False, False),
@@ -161,6 +162,13 @@ class ProxyAuthTest(unittest.TestCase):
         }
         for name, claims, nonce, valid in [
             ("valid", {}, "nonce", True),
+            ("issued within clock skew", {"iat": int(time.time()) + 30}, "nonce", True),
+            (
+                "issued beyond clock skew",
+                {"iat": int(time.time()) + 120},
+                "nonce",
+                False,
+            ),
             ("expired", {"exp": 1}, "nonce", False),
             ("wrong issuer", {"iss": "other"}, "nonce", False),
             ("wrong audience", {"aud": "other"}, "nonce", False),
