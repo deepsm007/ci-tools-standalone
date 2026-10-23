@@ -188,9 +188,16 @@ def login():
         )
     )
     try:
-        with HTTPServer(
+        server = HTTPServer(
             (os.environ.get("SM_CALLBACK_HOST", "127.0.0.1"), 8085), Callback
-        ) as server:
+        )
+    except OSError as error:
+        raise click.ClickException(
+            "Could not listen on local port 8085 for the SSO login. "
+            "Stop the program using that port, then retry."
+        ) from error
+    try:
+        with server:
             server.timeout = 0.5
             click.echo("Opening SSO login in your browser.", err=True)
             browser_request = os.environ.get("SM_BROWSER_REQUEST")
@@ -207,13 +214,15 @@ def login():
                         os.unlink(temporary)
             elif not webbrowser.open(url):
                 raise click.ClickException(
-                    "Could not open a browser. Run `login` in a browser-enabled environment."
+                    "Could not open a browser. Run the `login` command on a machine with a browser."
                 )
             deadline = time.monotonic() + LOGIN_TIMEOUT
             while not result and time.monotonic() < deadline:
                 server.handle_request()
         if not result:
-            raise click.ClickException("SSO login timed out. Run `login` to retry.")
+            raise click.ClickException(
+                "SSO login timed out. Run the `login` command to retry."
+            )
         if "error" in result:
             raise click.ClickException("SSO login was denied or cancelled.")
         response = requests.post(
@@ -230,23 +239,30 @@ def login():
         )
         if response.status_code != 200:
             raise click.ClickException(
-                "Dex rejected the login code. Run `login` to retry."
+                "The SSO login was rejected. Run the `login` command to retry."
             )
         token = response.json()["id_token"]
-        verify_token(token, nonce)
-        save_token(token)
+        try:
+            verify_token(token, nonce)
+        except (ValueError, KeyError, TypeError, StopIteration, GoogleAuthError) as error:
+            raise click.ClickException(
+                "Could not verify the SSO login token. Try running the `login` command again."
+            ) from error
+        try:
+            save_token(token)
+        except OSError as error:
+            raise click.ClickException(
+                f"Could not save the SSO login token ({error.strerror or error}). "
+                "Run the `clean` command, then the `login` command."
+            ) from error
         return token
-    except (
-        OSError,
-        requests.RequestException,
-        ValueError,
-        KeyError,
-        TypeError,
-        StopIteration,
-        GoogleAuthError,
-    ) as error:
+    except requests.RequestException as error:
         raise click.ClickException(
-            "SSO login failed. Check connectivity and that local port 8085 is available."
+            "Could not reach the SSO login service. Check your network connection, then retry."
+        ) from error
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise click.ClickException(
+            "SSO login failed. Run the `login` command to retry."
         ) from error
 
 

@@ -202,9 +202,18 @@ class ProxyAuthTest(unittest.TestCase):
 
     def test_login(self):
         real_get = requests.get
-        for name in (
-            "success", "denied", "timeout", "bad token", "no browser", "handoff"
-        ):
+        for name, message in [
+            ("success", None),
+            ("handoff", None),
+            ("denied", "denied or cancelled"),
+            ("timeout", "timed out"),
+            ("bad token", "Could not verify the SSO login token"),
+            ("no browser", "Could not open a browser"),
+            ("port in use", "local port 8085"),
+            ("rejected code", "SSO login was rejected"),
+            ("network failure", "network connection"),
+            ("save failure", "Could not save the SSO login token (Permission denied)"),
+        ]:
             with self.subTest(name=name):
                 threads = []
                 failures = []
@@ -256,8 +265,9 @@ class ProxyAuthTest(unittest.TestCase):
                     self.assertEqual(request_path.stat().st_mode & 0o777, 0o600)
                     browser(request_path.read_text())
 
-                response = Mock(status_code=200)
+                response = Mock(status_code=400 if name == "rejected code" else 200)
                 response.json.return_value = {"id_token": "dummy-token"}
+                real_server = proxy_auth.HTTPServer
                 with patch.dict(
                     os.environ, {"SM_CALLBACK_HOST": "127.0.0.1"}
                 ), patch.object(
@@ -265,13 +275,32 @@ class ProxyAuthTest(unittest.TestCase):
                 ), patch.object(
                     proxy_auth, "LOGIN_TIMEOUT", 0.1 if name == "timeout" else 5
                 ), patch.object(
-                    proxy_auth.requests, "post", return_value=response
+                    proxy_auth.requests,
+                    "post",
+                    return_value=response,
+                    side_effect=(
+                        requests.ConnectionError() if name == "network failure" else None
+                    ),
                 ) as exchange, patch.object(
+                    proxy_auth,
+                    "HTTPServer",
+                    side_effect=(
+                        OSError(48, "Address already in use")
+                        if name == "port in use"
+                        else real_server
+                    ),
+                ), patch.object(
                     proxy_auth,
                     "verify_token",
                     side_effect=ValueError() if name == "bad token" else None,
                 ), patch.object(
-                    proxy_auth, "save_token"
+                    proxy_auth,
+                    "save_token",
+                    side_effect=(
+                        PermissionError(13, "Permission denied")
+                        if name == "save failure"
+                        else None
+                    ),
                 ) as save, patch.object(
                     proxy_auth.click, "echo"
                 ) as echo, patch.object(
@@ -280,19 +309,24 @@ class ProxyAuthTest(unittest.TestCase):
                     os.environ.pop("SM_BROWSER_REQUEST", None)
                     if name == "handoff":
                         os.environ["SM_BROWSER_REQUEST"] = str(request_path)
-                    if name in ("success", "handoff"):
+                    if message is None:
                         self.assertEqual(proxy_auth.login(), "dummy-token")
                         save.assert_called_once_with("dummy-token")
                         data = exchange.call_args.kwargs["data"]
                         self.assertNotIn("client_secret", data)
                         self.assertGreaterEqual(len(data["code_verifier"]), 43)
                     else:
-                        with self.assertRaises(click.ClickException):
+                        with self.assertRaises(click.ClickException) as caught:
                             proxy_auth.login()
-                        save.assert_not_called()
-                    echo.assert_called_once_with(
-                        "Opening SSO login in your browser.", err=True
-                    )
+                        self.assertIn(message, str(caught.exception))
+                        if name != "save failure":
+                            save.assert_not_called()
+                    if name == "port in use":
+                        echo.assert_not_called()
+                    else:
+                        echo.assert_called_once_with(
+                            "Opening SSO login in your browser.", err=True
+                        )
                 for thread in threads:
                     thread.join(timeout=5)
                     self.assertFalse(thread.is_alive())
@@ -313,10 +347,13 @@ class ProxyAuthTest(unittest.TestCase):
             ("string response", [200], "wrong", False),
             ("number response", [200], 123, False),
             ("outdated wrapper", [], {}, False),
+            ("network failure", [None], {}, False),
         ]:
             with self.subTest(name=name):
                 responses = [
-                    Mock(status_code=status, json=Mock(return_value=payload))
+                    requests.ConnectionError()
+                    if status is None
+                    else Mock(status_code=status, json=Mock(return_value=payload))
                     for status in statuses
                 ]
                 with patch.object(
@@ -341,12 +378,14 @@ class ProxyAuthTest(unittest.TestCase):
                             get_token.assert_not_called()
                             request.assert_not_called()
                             continue
-                        if statuses[0] == 401:
-                            self.assertIn("sm login", str(caught.exception))
-                        if statuses[0] == 200:
-                            self.assertEqual(
-                                str(caught.exception), "Could not read the response."
-                            )
+                        expected = {
+                            None: "network connection",
+                            401: "Run the `login` command",
+                            503: "Listing secrets failed (HTTP 503)",
+                            200: "Received an invalid response",
+                        }.get(statuses[0])
+                        if expected:
+                            self.assertIn(expected, str(caught.exception))
                     login.assert_not_called()
                     request.assert_called_once()
                     self.assertFalse(request.call_args.kwargs["allow_redirects"])

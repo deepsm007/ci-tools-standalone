@@ -100,26 +100,33 @@ def list_secrets_from_proxy(collection):
             timeout=30,
             allow_redirects=False,
         )
-        if response.status_code == 401:
-            raise click.ClickException(
-                "Authentication was rejected. Run `sm login` to re-authenticate, then retry the command."
-            )
-        if response.status_code == 403:
-            raise click.ClickException(
-                f"You don't have permission to list collection '{collection}'."
-            )
-        if response.status_code != 200:
-            raise click.ClickException(
-                f"GSM proxy request failed (HTTP {response.status_code})."
-            )
+    except requests.RequestException as error:
+        raise click.ClickException(
+            "Could not reach the secret listing service. Check your network connection, then retry."
+        ) from error
+    if response.status_code == 401:
+        raise click.ClickException(
+            "Your SSO login was rejected or has expired. Run the `login` command, then retry."
+        )
+    if response.status_code == 403:
+        raise click.ClickException(
+            f"You don't have permission to list collection '{collection}'."
+        )
+    if response.status_code != 200:
+        raise click.ClickException(
+            f"Listing secrets failed (HTTP {response.status_code}). Retry later."
+        )
+    try:
         paths = response.json()["secrets"]
         if not isinstance(paths, list) or not all(
             isinstance(path, str) for path in paths
         ):
             raise ValueError("Invalid paths")
         return sorted(paths)
-    except (requests.RequestException, ValueError, KeyError, TypeError) as error:
-        raise click.ClickException("Could not read the response.") from error
+    except (ValueError, KeyError, TypeError) as error:
+        raise click.ClickException(
+            "Received an invalid response from the secret listing service."
+        ) from error
 
 
 def list_secrets_for_collection(collection: str, output: str):
