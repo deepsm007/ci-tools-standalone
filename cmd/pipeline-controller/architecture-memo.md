@@ -8,11 +8,20 @@ agentic mode. Chai owns second-stage execution unless a response timeout or
 
 ## Workflow
 
-- After applicable first-stage tests pass, create `ci/pipeline-gate`
+- In automatic mode, after applicable first-stage tests pass, create `ci/pipeline-gate`
   pending (`queued`). In LGTM mode, also require the current `lgtm` label or
   `pipeline-auto` override before creating readiness or starting its response timeout.
-  Either condition may arrive first. Removing approval preserves an existing gate
-  and its timer; each new HEAD/base requires current approval again.
+  Either condition may arrive first. Manual mode requires an explicit handoff command;
+  first-stage success and approval labels alone do not create its gate.
+  A trusted user's `/pipeline required` or
+  `/pipeline remaining` creates readiness immediately, even before first-stage success
+  and without LGTM. Both commands hand off to Chai; traditional mode keeps its existing
+  force-set and missing-tests dispatch behavior.
+  Repeated manual commands, first-stage completion, later approval and automatic events
+  reuse the same native gate for this PR HEAD SHA, including after completion or restart.
+  They do not reopen completed gates or refresh response timeouts. New SHAs can start a
+  new handoff under the same manual or automatic rules; mode-switch and retarget ownership
+  rules still apply. Removing approval preserves an existing gate and its timer.
   Successful readiness dispatch starts a 20-minute wait for Chai.
 - Any new comment from a configured Chai author during the wait cancels the response timeout,
   but leaves the gate pending. No message within 20 minutes hands second-stage

@@ -7,8 +7,9 @@ import (
 
 const pipelineHelp = "Pipeline commands:\n\n" +
 	"- `/pipeline help` — list commands.\n" +
-	"- `/pipeline required` — rerun the traditional second-stage set.\n" +
-	"- `/pipeline remaining` — run missing second-stage tests.\n" +
+	"- `/pipeline required`: rerun the traditional second-stage set; in agentic mode, request Chai handoff immediately, before first-stage success or LGTM.\n" +
+	"- `/pipeline remaining`: run missing traditional second-stage tests; in agentic mode, request the same immediate Chai handoff.\n" +
+	"  Agentic handoff uses one gate per current PR HEAD SHA. Repeated commands, automatic events and restarts reuse it without reopening completed gates or restarting the response timeout.\n" +
 	"- `/pipeline auto` — enable automatic dispatch in LGTM mode.\n" +
 	"- `/pipeline agentic-mode` — restore configured agentic mode (closed beta, limited enrolled repositories); completed dispatch and traditional rerun commands stay unchanged until the next HEAD SHA.\n" +
 	"- `/pipeline skip-agentic-mode` — use traditional scheduling for this PR, including future pushes.\n" +
