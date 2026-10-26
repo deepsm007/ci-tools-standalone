@@ -2,15 +2,17 @@
 # pylint: disable=E0401, C0413
 
 import json
+import os
 
 import click
-from google.cloud import secretmanager
+import proxy_auth
+import requests
 from util import (
-    ensure_authentication,
     get_group_collections,
-    get_secrets_from_index,
     validate_collection,
 )
+
+PROXY_URL = "https://gsm-proxy.ci.openshift.org"
 
 
 @click.command("list")
@@ -47,9 +49,7 @@ def list_secrets(output: str, collection: str, rover_group: str):
         )
 
     if collection != "":
-        client = secretmanager.SecretManagerServiceClient()
-        ensure_authentication(client, collection)
-        list_secrets_for_collection(client, collection, output)
+        list_secrets_for_collection(collection, output)
         return
 
     collections_dict = get_group_collections()
@@ -85,14 +85,54 @@ def list_collections_for_rover_group(
             click.echo(f"{collection}")
 
 
-def list_secrets_for_collection(
-    client: secretmanager.SecretManagerServiceClient, collection: str, output: str
-):
-    secret_list = get_secrets_from_index(client, collection
-    )
+def list_secrets_from_proxy(collection):
+    # Only the current wrapper script sets SM_AUTH_DIR and forwards the SSO login callback.
+    # This can be removed once we've moved everything to go through the proxy.
+    if "SM_AUTH_DIR" not in os.environ:
+        raise click.ClickException(
+            "Your hack/secret-manager.sh is outdated. Run `git pull` in your openshift/release checkout, then retry."
+        )
+    token = proxy_auth.get_token()
+    try:
+        response = requests.get(
+            f"{PROXY_URL}/api/v1/collections/{collection}/secrets",
+            headers={"Authorization": "Bearer " + token},
+            timeout=30,
+            allow_redirects=False,
+        )
+    except requests.RequestException as error:
+        raise click.ClickException(
+            "Could not reach the secret listing service. Check your network connection, then retry."
+        ) from error
+    if response.status_code == 401:
+        raise click.ClickException(
+            "Your SSO login was rejected or has expired. Run the `login` command, then retry."
+        )
+    if response.status_code == 403:
+        raise click.ClickException(
+            f"You don't have permission to list collection '{collection}', or it doesn't exist. "
+            "To see the collections a Rover group owns, run `list --rover-group <group>`. "
+            "If you were recently added to an owning Rover group, run the `login` command and retry."
+        )
+    if response.status_code != 200:
+        raise click.ClickException(
+            f"Listing secrets failed (HTTP {response.status_code}). Retry later."
+        )
+    try:
+        paths = response.json()["secrets"]
+        if not isinstance(paths, list) or not all(
+            isinstance(path, str) for path in paths
+        ):
+            raise ValueError("Invalid paths")
+        return sorted(paths)
+    except (ValueError, KeyError, TypeError) as error:
+        raise click.ClickException(
+            "Received an invalid response from the secret listing service."
+        ) from error
 
-    paths = [secret.replace("__", "/") for secret in secret_list]
-    paths.sort()
+
+def list_secrets_for_collection(collection: str, output: str):
+    paths = list_secrets_from_proxy(collection)
 
     if output == "json":
         click.echo(json.dumps(paths, indent=2))
