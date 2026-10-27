@@ -24,6 +24,8 @@ const (
 	syncPollInterval  = 2 * time.Second
 	syncTimeout       = 5 * time.Minute
 	tempAppNamePrefix = "cmv-pr-"
+	generateRetries   = 5
+	generateRetryWait = 2 * time.Second
 )
 
 type Config struct {
@@ -97,9 +99,7 @@ func (c *Client) GenerateApplications(ctx context.Context, applicationSets []arg
 			continue
 		}
 
-		resp, err := c.appsetClient.Generate(ctx, &applicationset.ApplicationSetGenerateRequest{
-			ApplicationSet: &appset,
-		})
+		resp, err := c.generateWithRetry(ctx, &appset)
 		if err != nil {
 			genErr = errors.Join(genErr, fmt.Errorf("ApplicationSet %q: %w", appset.Name, err))
 			continue
@@ -112,6 +112,49 @@ func (c *Client) GenerateApplications(ctx context.Context, applicationSets []arg
 		}
 	}
 	return generated, genErr
+}
+
+// generateWithRetry calls ApplicationSet.Generate, retrying when Argo CD's shared
+// git working tree hits a transient index.lock / HEAD.lock race.
+func (c *Client) generateWithRetry(ctx context.Context, appset *argov1alpha1.ApplicationSet) (*applicationset.ApplicationSetGenerateResponse, error) {
+	var lastErr error
+	for attempt := 1; attempt <= generateRetries; attempt++ {
+		resp, err := c.appsetClient.Generate(ctx, &applicationset.ApplicationSetGenerateRequest{
+			ApplicationSet: appset,
+		})
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if !isTransientGitLockError(err) || attempt == generateRetries {
+			return nil, err
+		}
+		logrus.WithError(err).WithFields(logrus.Fields{
+			"applicationSet": appset.Name,
+			"attempt":        attempt,
+		}).Warn("ApplicationSet generate hit transient git lock; retrying")
+		timer := time.NewTimer(generateRetryWait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil, lastErr
+}
+
+// isTransientGitLockError reports whether err looks like a concurrent git
+// checkout race on Argo CD's on-disk repository cache (index.lock / HEAD.lock).
+// Permanent failures such as permission denied on a lock file are not retried.
+func isTransientGitLockError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	// Git lock contention always includes "File exists"; do not treat other
+	// .lock failures (for example permission denied) as transient.
+	return strings.Contains(msg, "File exists") && strings.Contains(msg, ".lock")
 }
 
 // DryRunSync creates a temporary Application from source (PR revision, unique name),
